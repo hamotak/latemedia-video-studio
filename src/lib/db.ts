@@ -1,0 +1,4657 @@
+import "server-only";
+import Database from "better-sqlite3";
+import path from "node:path";
+import fs from "node:fs";
+import { getCachedProviderSecret, listCachedProviderSecrets } from "@/lib/provider-secret-cache";
+
+/**
+ * Resolve the project root by walking up from this source file until we
+ * find a `package.json`. This is more robust than `process.cwd()` — even
+ * if the user launches the app from a different directory (rare but
+ * possible on some shells), the data folder always ends up next to the
+ * package.json. Prevents the classic "I restarted and my API keys are
+ * gone" footgun where two runs saved into two different data folders.
+ */
+function findProjectRoot(...startDirs: string[]): string {
+  for (const startDir of startDirs) {
+    let cur = startDir;
+    for (let i = 0; i < 10; i++) {
+      if (fs.existsSync(path.join(cur, "package.json"))) return cur;
+      const parent = path.dirname(cur);
+      if (parent === cur) break;
+      cur = parent;
+    }
+  }
+  return process.cwd();
+}
+
+const PROJECT_ROOT = findProjectRoot(process.cwd(), __dirname);
+const isBuildPhase = process.env.NEXT_PHASE === "phase-production-build";
+
+// Where the SQLite database lives. `DATA_DIR` env var still wins (handy
+// for tests / advanced setups). Otherwise we always use
+// `<project-root>/data` so it's the same folder no matter where the
+// user happens to launch `npm run dev` from.
+export const DATA_DIR = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : path.join(PROJECT_ROOT, "data");
+const DB_PATH = path.join(DATA_DIR, "app.db");
+
+if (!isBuildPhase && !fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+declare global {
+  var __sqlite: Database.Database | undefined;
+}
+
+/**
+ * Detect Next.js production-build phase. During build, Next forks ~30
+ * parallel workers to "collect page data" for every route. Each worker
+ * imports this module → opens its own SQLite handle → runs initSchema
+ * (CREATE/ALTER on the same `app.db` file). 31 workers racing on the
+ * write lock blew through `busy_timeout=5000` and the build still
+ * crashed with SQLITE_BUSY for whichever worker drew the short straw.
+ *
+ * Workaround: during the build phase, give every worker its own
+ * throwaway `:memory:` database. No contention, no schema mutation on
+ * the real file, module imports just work. At runtime (start phase /
+ * dev) we still use the real `app.db` on disk.
+ *
+ * Every module-level CREATE/ALTER below is idempotent on a fresh
+ * memory DB (CREATE IF NOT EXISTS, ALTER wrapped in try/catch), so
+ * the same code path handles both modes.
+ */
+export const db =
+  global.__sqlite ?? new Database(isBuildPhase ? ":memory:" : DB_PATH);
+if (!global.__sqlite) {
+  // For real on-disk DBs we want WAL + foreign keys + a generous busy
+  // timeout. The `:memory:` build-phase DB keeps these too — they're
+  // harmless and they keep the schema-init code uniform across modes.
+  db.pragma("journal_mode = WAL");
+  // synchronous=FULL is the safest setting: every commit fsyncs before
+  // returning. Slower than the WAL default (NORMAL) by a few ms per write
+  // but immune to data loss on a hard kill (closing the terminal window,
+  // power loss, etc.). For a single-user local app the throughput trade
+  // is invisible, and the durability is exactly what we need given the
+  // user-reported "I closed the server and my API keys were gone" class
+  // of issue.
+  db.pragma("synchronous = FULL");
+  db.pragma("foreign_keys = ON");
+  db.pragma("busy_timeout = 5000");
+  // Only cache the singleton when it points at the real on-disk DB.
+  // The build-phase :memory: DB is per-worker and shouldn't leak into
+  // any cached runtime instance — we want the runtime singleton to
+  // open the real file.
+  if (!isBuildPhase) {
+    global.__sqlite = db;
+    // Best-effort WAL checkpoint + close on graceful shutdown. WAL stays
+    // durable even without this (NORMAL/FULL sync writes the WAL frame
+    // to disk before commit returns), but a clean close folds the WAL
+    // back into the main `.db` file so a curious user inspecting the
+    // data folder sees a single tidy `app.db` instead of three files.
+    const shutdown = () => {
+      try {
+        db.pragma("wal_checkpoint(TRUNCATE)");
+        db.close();
+      } catch {
+        /* process is going away anyway */
+      }
+    };
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
+    process.once("beforeExit", shutdown);
+  }
+  initSchema();
+}
+
+function initSchema() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS integrations (
+      name TEXT PRIMARY KEY,
+      api_key TEXT,
+      config_json TEXT,
+      enabled INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS channels (
+      id TEXT PRIMARY KEY,
+      title TEXT,
+      handle TEXT,
+      description TEXT,
+      subscriber_count INTEGER,
+      view_count INTEGER,
+      video_count INTEGER,
+      imported_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS videos (
+      id TEXT PRIMARY KEY,
+      channel_id TEXT,
+      title TEXT NOT NULL,
+      description TEXT,
+      published_at INTEGER,
+      duration_seconds INTEGER,
+      views INTEGER DEFAULT 0,
+      likes INTEGER DEFAULT 0,
+      comments INTEGER DEFAULT 0,
+      thumbnail_url TEXT,
+      tags TEXT,
+      imported_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+  `);
+  // chat_sessions / chat_messages CREATE blocks (and their PRAGMA-guarded
+  // attachment/thinking/pending_since/channel_id ALTERs) lived here until
+  // FIX-K stripped the /chat surface entirely. The module-init DROP block
+  // below removes any rows from pre-existing installs.
+}
+
+// Per-channel agent memory. One row per (channel, key) — durable facts
+// the agent should keep in mind across chat sessions. Written by the
+// save_channel_memory chat tool (two-step confirm) and the /channel-info
+// Agent memory panel. Cleared by forget_channel_memory or the panel.
+// ON DELETE CASCADE cleans up if the user removes the channel.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS channel_memory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    source TEXT,
+    confidence REAL NOT NULL DEFAULT 0.8,
+    updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    UNIQUE(channel_id, key),
+    FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_channel_memory_lookup
+    ON channel_memory(channel_id, confidence DESC, updated_at DESC);
+`);
+
+// Generic key-value cache with TTL — used for caching expensive YouTube
+// Analytics API responses so we don't hammer Google on every page load.
+// Keys are hand-rolled (e.g. "analytics.overview.28d"); values are JSON.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS api_cache (
+    cache_key TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    cached_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    expires_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_api_cache_expires ON api_cache(expires_at);
+`);
+
+// Drop retired tables — fresh installs shouldn't carry orphans forward.
+// transcripts_fts was an unused external-content FTS5 table that
+// desynced and raised "database disk image is malformed" on cascade.
+// transcripts / transcription_jobs / deepgram_usage retired in the
+// May 2026 simplification pass (transcription feature removed).
+try {
+  db.exec(`DROP TABLE IF EXISTS transcripts_fts`);
+  db.exec(`DROP TABLE IF EXISTS transcripts`);
+  db.exec(`DROP TABLE IF EXISTS transcription_jobs`);
+  db.exec(`DROP TABLE IF EXISTS deepgram_usage`);
+  db.exec(`DROP TABLE IF EXISTS video_hooks`);
+  db.exec(`DROP TABLE IF EXISTS hooks_library`);
+  // T1 deletions — /chat and /outliers surfaces removed in 2026-05. Run
+  // before any of the surviving schema is created (no FK references from
+  // any surviving table).
+  db.exec(`DROP TABLE IF EXISTS chat_messages`);
+  db.exec(`DROP TABLE IF EXISTS chat_sessions`);
+  db.exec(`DROP TABLE IF EXISTS outlier_format_videos`);
+  db.exec(`DROP TABLE IF EXISTS outlier_formats`);
+  db.exec(`DROP TABLE IF EXISTS outlier_explanations`);
+  // Pre-deploy cleanup — /settings/{alerts,import,preferences} removed.
+  // alert_fires is dropped BEFORE alert_rules because it has a FK on
+  // rule_id ON DELETE CASCADE; SQLite tolerates either order for IF
+  // EXISTS but the safer-looking order matches the dependency chain.
+  db.exec(`DROP TABLE IF EXISTS alert_fires`);
+  db.exec(`DROP TABLE IF EXISTS alert_state`);
+  db.exec(`DROP TABLE IF EXISTS alert_rules`);
+  db.exec(`DROP TABLE IF EXISTS competitor_alerts`);
+  db.exec(`DROP TABLE IF EXISTS alerts`);
+  db.exec(`DROP TABLE IF EXISTS user_preferences`);
+} catch {
+  /* table didn't exist or rare concurrent issue — moving on either way */
+}
+
+try {
+  const cols = db
+    .prepare(`PRAGMA table_info(integrations)`)
+    .all() as { name: string }[];
+  if (!cols.some((c) => c.name === "config_json")) {
+    db.exec(`ALTER TABLE integrations ADD COLUMN config_json TEXT`);
+  }
+} catch {
+  /* noop */
+}
+
+export function getIntegration(name: string) {
+  const cached = getCachedProviderSecret(name);
+  if (cached) return cached;
+
+  return db
+    .prepare("SELECT name, api_key, enabled, config_json FROM integrations WHERE name = ?")
+    .get(name) as
+    | { name: string; api_key: string | null; enabled: number; config_json: string | null }
+    | undefined;
+}
+
+export function setIntegration(name: string, apiKey: string) {
+  const enabled = apiKey.trim().length > 0 ? 1 : 0;
+  db.prepare(
+    `INSERT INTO integrations (name, api_key, enabled, updated_at)
+     VALUES (?, ?, ?, strftime('%s','now'))
+     ON CONFLICT(name) DO UPDATE SET
+       api_key = excluded.api_key,
+       enabled = excluded.enabled,
+       updated_at = excluded.updated_at`
+  ).run(name, apiKey, enabled);
+}
+
+export function getIntegrationConfig<T = Record<string, unknown>>(
+  name: string
+): T | null {
+  const row = getIntegration(name);
+  if (!row?.config_json) return null;
+  try {
+    const parsed = JSON.parse(row.config_json) as unknown;
+    return parsed && typeof parsed === "object" ? (parsed as T) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function setIntegrationConfig(
+  name: string,
+  config: Record<string, unknown>
+): void {
+  const compact = Object.fromEntries(
+    Object.entries(config).map(([k, v]) => [k, typeof v === "string" ? v.trim() : v])
+  );
+  const enabled = Object.values(compact).every(
+    (v) => typeof v === "string" ? v.trim().length > 0 : v !== null && v !== undefined
+  )
+    ? 1
+    : 0;
+  db.prepare(
+    `INSERT INTO integrations (name, api_key, config_json, enabled, updated_at)
+     VALUES (?, NULL, ?, ?, strftime('%s','now'))
+     ON CONFLICT(name) DO UPDATE SET
+       config_json = excluded.config_json,
+       enabled = excluded.enabled,
+       updated_at = excluded.updated_at`
+  ).run(name, JSON.stringify(compact), enabled);
+}
+
+export function listIntegrations() {
+  const cached = listCachedProviderSecrets();
+  const rows = db
+    .prepare("SELECT name, api_key, enabled, config_json FROM integrations")
+    .all() as {
+    name: string;
+    api_key: string | null;
+    enabled: number;
+    config_json: string | null;
+  }[];
+  const merged = new Map(rows.map((row) => [row.name, row]));
+  for (const row of cached) merged.set(row.name, row);
+  return Array.from(merged.values());
+}
+
+/* ---------- Generic settings (key-value) ---------- */
+
+export function getSetting(key: string): string | null {
+  const row = db
+    .prepare("SELECT value FROM settings WHERE key = ?")
+    .get(key) as { value: string } | undefined;
+  return row?.value ?? null;
+}
+
+export function setSetting(key: string, value: string): void {
+  db.prepare(
+    `INSERT INTO settings (key, value, updated_at)
+     VALUES (?, ?, strftime('%s','now'))
+     ON CONFLICT(key) DO UPDATE SET
+       value = excluded.value,
+       updated_at = excluded.updated_at`
+  ).run(key, value);
+}
+
+/* ---------- Channel & videos ---------- */
+
+export type Channel = {
+  id: string;
+  title: string | null;
+  handle: string | null;
+  description: string | null;
+  subscriber_count: number | null;
+  view_count: number | null;
+  video_count: number | null;
+  imported_at: number;
+  avatar_url?: string | null;
+  topic_analysis_json?: string | null;
+  topic_analysis_at?: string | null;
+  // User-managed metadata (set via /integrations row Edit). All
+  // optional; missing on rows imported before the migration ran.
+  editor_name?: string | null;
+  cms_name?: string | null;
+  cms_cut_percent?: number | null;
+  adsense_name?: string | null;
+  monetization_status?: "monetized" | "pending" | "not_eligible" | null;
+  notes?: string | null;
+  expected_videos_per_month?: number | null;
+  // Legacy 5-field context model — deprecated. Read only by the boot
+  // migration that concatenates them into channel_description. The
+  // agent's runtime prompt builders no longer touch these.
+  niche?: string;
+  positioning?: string;
+  audience?: string;
+  voice?: string;
+  external_sources?: string;
+  // T9 — HAmo-authored hard-enforcement ideation rules. Injected
+  // verbatim into the ideation compose prompt (or "(none set)" when
+  // empty). Edited on /channel-info; chat tool update_channel_context
+  // also accepts this field.
+  ideation_rules?: string;
+  // The one paragraph the agent reads before every job. Single source
+  // of truth for niche/positioning/audience/voice — replaces the legacy
+  // 5 fields. ≤1500 chars after trim.
+  channel_description?: string;
+  // T3 — comma-separated topic ban list. Pipeline hardRuleCheck() rejects
+  // any candidate idea matching tokens in this list.
+  banned_topics?: string | null;
+  // One subreddit per line. Used by Brave-backed Reddit web signals;
+  // user-curated so the model only studies communities HAmo trusts.
+  reddit_sources?: string | null;
+  // Per-channel packaging/style goals for Image Studio. Kept separate
+  // from ideation_rules so visual generation can learn a visual system
+  // without polluting title/idea generation.
+  thumbnail_style_goals?: string | null;
+  // Human-authored visual design notes for Image Studio.
+  thumbnail_design_rules?: string | null;
+};
+
+/**
+ * Resolve the channel's description with a legacy-fields fallback.
+ * Returns channel_description trimmed when non-empty; otherwise
+ * concatenates niche/positioning/audience/voice/external_sources with
+ * paragraph breaks (capped at 1500 chars). Returns "" when everything
+ * is empty.
+ *
+ * Used by the ideation compose prompt so a channel that hasn't been
+ * migrated yet (or had its description manually cleared) still
+ * surfaces the legacy data to the agent.
+ */
+export function resolveChannelDescription(c: Channel | null | undefined): string {
+  if (!c) return "";
+  const desc = (c.channel_description ?? "").trim();
+  if (desc.length > 0) return desc;
+  const parts = [c.niche, c.positioning, c.audience, c.voice, c.external_sources]
+    .map((s) => (s ?? "").trim())
+    .filter((s) => s.length > 0);
+  if (parts.length === 0) return "";
+  const joined = parts.join("\n\n");
+  return joined.length > 1500 ? `${joined.slice(0, 1499).trimEnd()}…` : joined;
+}
+
+/**
+ * Patch the user-managed metadata fields of a channel. Only the fields
+ * passed in are updated; absent fields stay untouched. Pass `null` for
+ * a field to explicitly clear it.
+ */
+export type ChannelMeta = {
+  editor_name?: string | null;
+  cms_name?: string | null;
+  cms_cut_percent?: number | null;
+  adsense_name?: string | null;
+  monetization_status?: "monetized" | "pending" | "not_eligible" | null;
+  notes?: string | null;
+  expected_videos_per_month?: number | null;
+};
+
+export function updateChannelMeta(channelId: string, patch: ChannelMeta): void {
+  const sets: string[] = [];
+  const args: (string | number | null)[] = [];
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === undefined) continue;
+    sets.push(`${k} = ?`);
+    args.push(v as string | number | null);
+  }
+  if (sets.length === 0) return;
+  args.push(channelId);
+  db.prepare(`UPDATE channels SET ${sets.join(", ")} WHERE id = ?`).run(...args);
+}
+
+/**
+ * Channel context fields edited on /channel-info. Snake-case here is the
+ * column name; the API route maps the camelCase `externalSources` wire
+ * shape to `external_sources` before calling this. Separate from
+ * updateChannelMeta because the two pages have different concerns:
+ * /settings/integrations owns billing/monetization meta, /channel-info
+ * owns the strategy/voice context that downstream AI features consume.
+ */
+export type ChannelContextField =
+  | "channel_description"
+  | "ideation_rules"
+  // T3 — comma-separated topic ban list. Hard-rule check in
+  // src/lib/ideate/pipeline.ts rejects any candidate idea whose title
+  // or description contains a token from this list.
+  | "banned_topics"
+  | "reddit_sources"
+  | "thumbnail_style_goals"
+  | "thumbnail_design_rules"
+  // Legacy — kept writable so old migrations + the chat tool's
+  // backwards-compatible path keep working. UI no longer surfaces these.
+  | "niche"
+  | "positioning"
+  | "audience"
+  | "voice"
+  | "external_sources";
+
+const CHANNEL_CONTEXT_FIELDS: readonly ChannelContextField[] = [
+  "channel_description",
+  "ideation_rules",
+  "banned_topics",
+  "reddit_sources",
+  "thumbnail_style_goals",
+  "thumbnail_design_rules",
+  "niche",
+  "positioning",
+  "audience",
+  "voice",
+  "external_sources",
+] as const;
+
+export function updateChannelContext(
+  channelId: string,
+  field: ChannelContextField,
+  value: string
+): Channel | null {
+  if (!CHANNEL_CONTEXT_FIELDS.includes(field)) return null;
+  db.prepare(`UPDATE channels SET ${field} = ? WHERE id = ?`).run(
+    value,
+    channelId
+  );
+  return (
+    (db.prepare(`SELECT * FROM channels WHERE id = ?`).get(channelId) as
+      | Channel
+      | undefined) ?? null
+  );
+}
+
+/**
+ * Batch variant — updates multiple context fields in a single SQL
+ * statement. Used by the chat tool `update_channel_context` so the
+ * agent's approved diff lands atomically (no partial write if one
+ * column update were to error). Unknown keys in `patch` are silently
+ * filtered out — the caller is expected to validate before calling,
+ * this is just a safety net.
+ */
+export type ChannelContextPatch = Partial<
+  Record<ChannelContextField, string>
+>;
+
+export function updateChannelContextBatch(
+  channelId: string,
+  patch: ChannelContextPatch
+): Channel | null {
+  const sets: string[] = [];
+  const args: string[] = [];
+  for (const field of CHANNEL_CONTEXT_FIELDS) {
+    const v = patch[field];
+    if (typeof v !== "string") continue;
+    sets.push(`${field} = ?`);
+    args.push(v);
+  }
+  if (sets.length === 0) {
+    return (
+      (db.prepare(`SELECT * FROM channels WHERE id = ?`).get(channelId) as
+        | Channel
+        | undefined) ?? null
+    );
+  }
+  args.push(channelId);
+  db.prepare(`UPDATE channels SET ${sets.join(", ")} WHERE id = ?`).run(
+    ...args
+  );
+  return (
+    (db.prepare(`SELECT * FROM channels WHERE id = ?`).get(channelId) as
+      | Channel
+      | undefined) ?? null
+  );
+}
+
+/* ---------- Channel memory ---------- */
+/**
+ * Durable per-channel facts the agent should remember across chats.
+ * Schema lives at module init above (CREATE TABLE IF NOT EXISTS
+ * channel_memory). Keyed by (channel_id, key) — upsert overwrites.
+ * Confidence defaults to 0.8 when written by chat tools; the
+ * /channel-info UI panel can leave it default or surface a slider.
+ */
+export type ChannelMemory = {
+  id: number;
+  channel_id: string;
+  key: string;
+  value: string;
+  source: string | null;
+  confidence: number;
+  updated_at: number;
+};
+
+export function listChannelMemory(channelId: string): ChannelMemory[] {
+  return db
+    .prepare(
+      `SELECT id, channel_id, key, value, source, confidence, updated_at
+       FROM channel_memory
+       WHERE channel_id = ?
+       ORDER BY confidence DESC, updated_at DESC`
+    )
+    .all(channelId) as ChannelMemory[];
+}
+
+export function getChannelMemory(
+  channelId: string,
+  key: string
+): ChannelMemory | null {
+  return (
+    (db
+      .prepare(
+        `SELECT id, channel_id, key, value, source, confidence, updated_at
+         FROM channel_memory
+         WHERE channel_id = ? AND key = ?`
+      )
+      .get(channelId, key) as ChannelMemory | undefined) ?? null
+  );
+}
+
+export function upsertChannelMemory(opts: {
+  channelId: string;
+  key: string;
+  value: string;
+  source?: string | null;
+  confidence?: number;
+}): ChannelMemory | null {
+  const confidence =
+    typeof opts.confidence === "number"
+      ? Math.max(0, Math.min(1, opts.confidence))
+      : 0.8;
+  db.prepare(
+    `INSERT INTO channel_memory
+       (channel_id, key, value, source, confidence, updated_at)
+     VALUES (?, ?, ?, ?, ?, strftime('%s','now'))
+     ON CONFLICT(channel_id, key) DO UPDATE SET
+       value      = excluded.value,
+       source     = excluded.source,
+       confidence = excluded.confidence,
+       updated_at = strftime('%s','now')`
+  ).run(opts.channelId, opts.key, opts.value, opts.source ?? null, confidence);
+  return getChannelMemory(opts.channelId, opts.key);
+}
+
+export function deleteChannelMemory(channelId: string, key: string): boolean {
+  const info = db
+    .prepare(`DELETE FROM channel_memory WHERE channel_id = ? AND key = ?`)
+    .run(channelId, key);
+  return info.changes > 0;
+}
+
+/* ---------- Tags ---------- */
+
+export type Tag = {
+  id: number;
+  name: string;
+  cut_percent: number | null;
+  color: string | null;
+  created_at: number;
+};
+
+export type TagWithUsage = Tag & {
+  channel_count: number;
+};
+
+export function listTags(): TagWithUsage[] {
+  return db
+    .prepare(
+      `SELECT t.*, COUNT(ct.channel_id) AS channel_count
+       FROM tags t
+       LEFT JOIN channel_tags ct ON ct.tag_id = t.id
+       GROUP BY t.id
+       ORDER BY t.name COLLATE NOCASE ASC`
+    )
+    .all() as TagWithUsage[];
+}
+
+export function getTag(id: number): Tag | null {
+  return (
+    (db.prepare(`SELECT * FROM tags WHERE id = ?`).get(id) as Tag | undefined) ??
+    null
+  );
+}
+
+export function getTagByName(name: string): Tag | null {
+  return (
+    (db.prepare(`SELECT * FROM tags WHERE name = ? COLLATE NOCASE`).get(name) as
+      | Tag
+      | undefined) ?? null
+  );
+}
+
+export function createTag(input: {
+  name: string;
+  cut_percent?: number | null;
+  color?: string | null;
+}): Tag {
+  const info = db
+    .prepare(
+      `INSERT INTO tags (name, cut_percent, color)
+       VALUES (?, ?, ?)`
+    )
+    .run(
+      input.name.trim(),
+      input.cut_percent ?? null,
+      input.color ?? null
+    );
+  return getTag(Number(info.lastInsertRowid))!;
+}
+
+export function updateTag(
+  id: number,
+  patch: { name?: string; cut_percent?: number | null; color?: string | null }
+): Tag | null {
+  const sets: string[] = [];
+  const args: (string | number | null)[] = [];
+  if (patch.name !== undefined) {
+    sets.push("name = ?");
+    args.push(patch.name.trim());
+  }
+  if ("cut_percent" in patch) {
+    sets.push("cut_percent = ?");
+    args.push(patch.cut_percent ?? null);
+  }
+  if ("color" in patch) {
+    sets.push("color = ?");
+    args.push(patch.color ?? null);
+  }
+  if (sets.length === 0) return getTag(id);
+  args.push(id);
+  db.prepare(`UPDATE tags SET ${sets.join(", ")} WHERE id = ?`).run(...args);
+  return getTag(id);
+}
+
+export function deleteTag(id: number): boolean {
+  // FK CASCADE removes channel_tags rows automatically.
+  const info = db.prepare(`DELETE FROM tags WHERE id = ?`).run(id);
+  return info.changes > 0;
+}
+
+/** Tags currently attached to a single channel. */
+export function listTagsForChannel(channelId: string): Tag[] {
+  return db
+    .prepare(
+      `SELECT t.* FROM tags t
+       JOIN channel_tags ct ON ct.tag_id = t.id
+       WHERE ct.channel_id = ?
+       ORDER BY t.name COLLATE NOCASE ASC`
+    )
+    .all(channelId) as Tag[];
+}
+
+/** Channels currently carrying a single tag. */
+export function listChannelsForTag(tagId: number): { id: string; title: string | null }[] {
+  return db
+    .prepare(
+      `SELECT c.id, c.title FROM channels c
+       JOIN channel_tags ct ON ct.channel_id = c.id
+       WHERE ct.tag_id = ?
+       ORDER BY c.title COLLATE NOCASE ASC`
+    )
+    .all(tagId) as { id: string; title: string | null }[];
+}
+
+export function attachTag(channelId: string, tagId: number): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO channel_tags (channel_id, tag_id) VALUES (?, ?)`
+  ).run(channelId, tagId);
+}
+
+export function detachTag(channelId: string, tagId: number): void {
+  db.prepare(
+    `DELETE FROM channel_tags WHERE channel_id = ? AND tag_id = ?`
+  ).run(channelId, tagId);
+}
+
+/**
+ * Returns a map of channel_id → Tag[] for ALL channels in one query.
+ * Used by analytics endpoints that need to fold tag info into per-
+ * channel rows without N+1.
+ */
+export function tagsByChannel(): Map<string, Tag[]> {
+  const rows = db
+    .prepare(
+      `SELECT ct.channel_id, t.id, t.name, t.cut_percent, t.color, t.created_at
+       FROM channel_tags ct
+       JOIN tags t ON t.id = ct.tag_id
+       ORDER BY t.name COLLATE NOCASE ASC`
+    )
+    .all() as ({ channel_id: string } & Tag)[];
+  const map = new Map<string, Tag[]>();
+  for (const r of rows) {
+    const list = map.get(r.channel_id) ?? [];
+    list.push({
+      id: r.id,
+      name: r.name,
+      cut_percent: r.cut_percent,
+      color: r.color,
+      created_at: r.created_at,
+    });
+    map.set(r.channel_id, list);
+  }
+  return map;
+}
+
+/* ---------- Teams ---------- */
+
+export type Team = {
+  id: number;
+  name: string;
+  color: string | null;
+  description: string | null;
+  created_at: number;
+};
+
+export type TeamWithMemberCount = Team & { member_count: number };
+
+export function listTeams(): TeamWithMemberCount[] {
+  return db
+    .prepare(
+      `SELECT t.*, COUNT(ut.user_id) AS member_count
+       FROM teams t
+       LEFT JOIN user_teams ut ON ut.team_id = t.id
+       GROUP BY t.id
+       ORDER BY t.name COLLATE NOCASE ASC`
+    )
+    .all() as TeamWithMemberCount[];
+}
+
+export function getTeam(id: number): Team | null {
+  return (db.prepare(`SELECT * FROM teams WHERE id = ?`).get(id) as Team | undefined) ?? null;
+}
+
+export function createTeam(input: {
+  name: string;
+  color?: string | null;
+  description?: string | null;
+}): Team {
+  const info = db
+    .prepare(`INSERT INTO teams (name, color, description) VALUES (?, ?, ?)`)
+    .run(input.name.trim(), input.color ?? null, input.description ?? null);
+  return getTeam(Number(info.lastInsertRowid))!;
+}
+
+export function updateTeam(
+  id: number,
+  patch: { name?: string; color?: string | null; description?: string | null }
+): Team | null {
+  const sets: string[] = [];
+  const args: (string | number | null)[] = [];
+  if (patch.name !== undefined) { sets.push("name = ?"); args.push(patch.name.trim()); }
+  if ("color" in patch) { sets.push("color = ?"); args.push(patch.color ?? null); }
+  if ("description" in patch) { sets.push("description = ?"); args.push(patch.description ?? null); }
+  if (sets.length === 0) return getTeam(id);
+  args.push(id);
+  db.prepare(`UPDATE teams SET ${sets.join(", ")} WHERE id = ?`).run(...args);
+  return getTeam(id);
+}
+
+export function deleteTeam(id: number): boolean {
+  const info = db.prepare(`DELETE FROM teams WHERE id = ?`).run(id);
+  return info.changes > 0;
+}
+
+export function listTeamMembers(teamId: number): { user_id: string; assigned_at: number }[] {
+  return db
+    .prepare(`SELECT user_id, assigned_at FROM user_teams WHERE team_id = ? ORDER BY assigned_at ASC`)
+    .all(teamId) as { user_id: string; assigned_at: number }[];
+}
+
+export function listTeamsForUser(userId: string): Team[] {
+  return db
+    .prepare(
+      `SELECT t.* FROM teams t
+       JOIN user_teams ut ON ut.team_id = t.id
+       WHERE ut.user_id = ?
+       ORDER BY t.name COLLATE NOCASE ASC`
+    )
+    .all(userId) as Team[];
+}
+
+export function assignUserToTeam(userId: string, teamId: number): void {
+  db.prepare(`INSERT OR IGNORE INTO user_teams (user_id, team_id) VALUES (?, ?)`).run(userId, teamId);
+}
+
+export function removeUserFromTeam(userId: string, teamId: number): void {
+  db.prepare(`DELETE FROM user_teams WHERE user_id = ? AND team_id = ?`).run(userId, teamId);
+}
+
+/** Returns map of teamId → userId[] for all teams in one query. */
+export function membersByTeam(): Map<number, string[]> {
+  const rows = db
+    .prepare(`SELECT team_id, user_id FROM user_teams ORDER BY assigned_at ASC`)
+    .all() as { team_id: number; user_id: string }[];
+  const map = new Map<number, string[]>();
+  for (const r of rows) {
+    const list = map.get(r.team_id) ?? [];
+    list.push(r.user_id);
+    map.set(r.team_id, list);
+  }
+  return map;
+}
+
+/* ──────────────────────────────────────────────────
+   BOARDS
+────────────────────────────────────────────────── */
+
+export type Board = {
+  id: number;
+  name: string;
+  description: string | null;
+  color: string | null;
+  created_at: number;
+};
+
+export type BoardColumn = {
+  id: number;
+  board_id: number;
+  name: string;
+  color: string | null;
+  position: number;
+  created_at: number;
+};
+
+export type BoardCard = {
+  id: number;
+  board_id: number;
+  column_id: number;
+  title: string;
+  description: string | null;
+  content_notes: string | null;
+  thumbnail_url: string | null;
+  platform: string | null;
+  due_date: number | null;
+  priority: "low" | "medium" | "high" | "urgent";
+  position: number;
+  created_at: number;
+  updated_at: number;
+};
+
+export function listBoards(): Board[] {
+  return db.prepare(`SELECT * FROM boards ORDER BY created_at ASC`).all() as Board[];
+}
+
+export function getBoard(id: number): Board | undefined {
+  return db.prepare(`SELECT * FROM boards WHERE id = ?`).get(id) as Board | undefined;
+}
+
+export function createBoard(input: {
+  name: string;
+  description?: string | null;
+  color?: string | null;
+}): Board {
+  const info = db
+    .prepare(`INSERT INTO boards (name, description, color) VALUES (?, ?, ?)`)
+    .run(input.name.trim(), input.description ?? null, input.color ?? null);
+  return db.prepare(`SELECT * FROM boards WHERE id = ?`).get(Number(info.lastInsertRowid)) as Board;
+}
+
+export function updateBoard(
+  id: number,
+  patch: { name?: string; description?: string | null; color?: string | null }
+): Board | undefined {
+  const sets: string[] = [];
+  const args: (string | number | null)[] = [];
+  if (patch.name !== undefined) { sets.push("name = ?"); args.push(patch.name.trim()); }
+  if ("description" in patch) { sets.push("description = ?"); args.push(patch.description ?? null); }
+  if ("color" in patch) { sets.push("color = ?"); args.push(patch.color ?? null); }
+  if (!sets.length) return getBoard(id);
+  args.push(id);
+  db.prepare(`UPDATE boards SET ${sets.join(", ")} WHERE id = ?`).run(...args);
+  return getBoard(id);
+}
+
+export function deleteBoard(id: number): boolean {
+  return db.prepare(`DELETE FROM boards WHERE id = ?`).run(id).changes > 0;
+}
+
+export function listColumns(boardId: number): BoardColumn[] {
+  return db
+    .prepare(`SELECT * FROM board_columns WHERE board_id = ? ORDER BY position ASC, id ASC`)
+    .all(boardId) as BoardColumn[];
+}
+
+export function createColumn(input: {
+  board_id: number;
+  name: string;
+  color?: string | null;
+  position?: number;
+}): BoardColumn {
+  const pos =
+    input.position ??
+    ((db.prepare(
+      `SELECT COALESCE(MAX(position)+1, 0) AS p FROM board_columns WHERE board_id = ?`
+    ).get(input.board_id) as { p: number }).p);
+  const info = db
+    .prepare(`INSERT INTO board_columns (board_id, name, color, position) VALUES (?, ?, ?, ?)`)
+    .run(input.board_id, input.name.trim(), input.color ?? null, pos);
+  return db.prepare(`SELECT * FROM board_columns WHERE id = ?`).get(Number(info.lastInsertRowid)) as BoardColumn;
+}
+
+export function updateColumn(
+  id: number,
+  patch: { name?: string; color?: string | null; position?: number }
+): BoardColumn | undefined {
+  const sets: string[] = [];
+  const args: (string | number | null)[] = [];
+  if (patch.name !== undefined) { sets.push("name = ?"); args.push(patch.name.trim()); }
+  if ("color" in patch) { sets.push("color = ?"); args.push(patch.color ?? null); }
+  if (patch.position !== undefined) { sets.push("position = ?"); args.push(patch.position); }
+  if (!sets.length) return db.prepare(`SELECT * FROM board_columns WHERE id = ?`).get(id) as BoardColumn | undefined;
+  args.push(id);
+  db.prepare(`UPDATE board_columns SET ${sets.join(", ")} WHERE id = ?`).run(...args);
+  return db.prepare(`SELECT * FROM board_columns WHERE id = ?`).get(id) as BoardColumn | undefined;
+}
+
+export function deleteColumn(id: number): boolean {
+  return db.prepare(`DELETE FROM board_columns WHERE id = ?`).run(id).changes > 0;
+}
+
+export function listCardsByBoard(boardId: number): BoardCard[] {
+  return db
+    .prepare(`SELECT * FROM board_cards WHERE board_id = ? ORDER BY column_id ASC, position ASC, id ASC`)
+    .all(boardId) as BoardCard[];
+}
+
+export function getCard(id: number): BoardCard | undefined {
+  return db.prepare(`SELECT * FROM board_cards WHERE id = ?`).get(id) as BoardCard | undefined;
+}
+
+export function createCard(input: {
+  board_id: number;
+  column_id: number;
+  title: string;
+  description?: string | null;
+  content_notes?: string | null;
+  thumbnail_url?: string | null;
+  platform?: string | null;
+  due_date?: number | null;
+  priority?: "low" | "medium" | "high" | "urgent";
+}): BoardCard {
+  const pos = (
+    db
+      .prepare(`SELECT COALESCE(MAX(position)+1, 0) AS p FROM board_cards WHERE column_id = ?`)
+      .get(input.column_id) as { p: number }
+  ).p;
+  const info = db
+    .prepare(
+      `INSERT INTO board_cards
+         (board_id, column_id, title, description, content_notes, thumbnail_url, platform, due_date, priority, position)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      input.board_id,
+      input.column_id,
+      input.title.trim(),
+      input.description ?? null,
+      input.content_notes ?? null,
+      input.thumbnail_url ?? null,
+      input.platform ?? null,
+      input.due_date ?? null,
+      input.priority ?? "medium",
+      pos
+    );
+  return db.prepare(`SELECT * FROM board_cards WHERE id = ?`).get(Number(info.lastInsertRowid)) as BoardCard;
+}
+
+export function updateCard(
+  id: number,
+  patch: {
+    title?: string;
+    description?: string | null;
+    content_notes?: string | null;
+    thumbnail_url?: string | null;
+    platform?: string | null;
+    due_date?: number | null;
+    priority?: "low" | "medium" | "high" | "urgent";
+    column_id?: number;
+    position?: number;
+  }
+): BoardCard | undefined {
+  const sets: string[] = ["updated_at = strftime('%s','now')"];
+  const args: (string | number | null)[] = [];
+  if (patch.title !== undefined) { sets.push("title = ?"); args.push(patch.title.trim()); }
+  if ("description" in patch) { sets.push("description = ?"); args.push(patch.description ?? null); }
+  if ("content_notes" in patch) { sets.push("content_notes = ?"); args.push(patch.content_notes ?? null); }
+  if ("thumbnail_url" in patch) { sets.push("thumbnail_url = ?"); args.push(patch.thumbnail_url ?? null); }
+  if ("platform" in patch) { sets.push("platform = ?"); args.push(patch.platform ?? null); }
+  if ("due_date" in patch) { sets.push("due_date = ?"); args.push(patch.due_date ?? null); }
+  if (patch.priority !== undefined) { sets.push("priority = ?"); args.push(patch.priority); }
+  if (patch.column_id !== undefined) { sets.push("column_id = ?"); args.push(patch.column_id); }
+  if (patch.position !== undefined) { sets.push("position = ?"); args.push(patch.position); }
+  args.push(id);
+  db.prepare(`UPDATE board_cards SET ${sets.join(", ")} WHERE id = ?`).run(...args);
+  return getCard(id);
+}
+
+export function deleteCard(id: number): boolean {
+  return db.prepare(`DELETE FROM board_cards WHERE id = ?`).run(id).changes > 0;
+}
+
+/** Returns map of cardId → userId[] for all cards on a board. */
+export function assigneesByBoard(boardId: number): Map<number, string[]> {
+  const rows = db
+    .prepare(
+      `SELECT ca.card_id, ca.user_id
+       FROM card_assignees ca
+       JOIN board_cards bc ON bc.id = ca.card_id
+       WHERE bc.board_id = ?
+       ORDER BY ca.assigned_at ASC`
+    )
+    .all(boardId) as { card_id: number; user_id: string }[];
+  const map = new Map<number, string[]>();
+  for (const r of rows) {
+    const list = map.get(r.card_id) ?? [];
+    list.push(r.user_id);
+    map.set(r.card_id, list);
+  }
+  return map;
+}
+
+export function addCardAssignee(cardId: number, userId: string): void {
+  db.prepare(`INSERT OR IGNORE INTO card_assignees (card_id, user_id) VALUES (?, ?)`).run(cardId, userId);
+}
+
+export function removeCardAssignee(cardId: number, userId: string): void {
+  db.prepare(`DELETE FROM card_assignees WHERE card_id = ? AND user_id = ?`).run(cardId, userId);
+}
+
+export function listCardAssignees(cardId: number): string[] {
+  return (
+    db
+      .prepare(`SELECT user_id FROM card_assignees WHERE card_id = ? ORDER BY assigned_at ASC`)
+      .all(cardId) as { user_id: string }[]
+  ).map((r) => r.user_id);
+}
+
+export function addCardTeam(cardId: number, teamId: number): void {
+  db.prepare(`INSERT OR IGNORE INTO card_teams (card_id, team_id) VALUES (?, ?)`).run(cardId, teamId);
+}
+
+export function removeCardTeam(cardId: number, teamId: number): void {
+  db.prepare(`DELETE FROM card_teams WHERE card_id = ? AND team_id = ?`).run(cardId, teamId);
+}
+
+/** Returns map of cardId → teamId[] for all cards on a board. */
+export function cardTeamsByBoard(boardId: number): Map<number, number[]> {
+  const rows = db
+    .prepare(
+      `SELECT ct.card_id, ct.team_id
+       FROM card_teams ct
+       JOIN board_cards bc ON bc.id = ct.card_id
+       WHERE bc.board_id = ?
+       ORDER BY ct.assigned_at ASC`
+    )
+    .all(boardId) as { card_id: number; team_id: number }[];
+  const map = new Map<number, number[]>();
+  for (const r of rows) {
+    const list = map.get(r.card_id) ?? [];
+    list.push(r.team_id);
+    map.set(r.card_id, list);
+  }
+  return map;
+}
+
+export type Video = {
+  id: string;
+  channel_id: string | null;
+  title: string;
+  description: string | null;
+  published_at: number | null;
+  duration_seconds: number | null;
+  views: number;
+  likes: number;
+  comments: number;
+  thumbnail_url: string | null;
+  tags: string | null;
+  imported_at: number;
+};
+
+export function upsertChannel(
+  c: Partial<Channel> & { id: string; avatar_url?: string | null }
+): void {
+  db.prepare(
+    `INSERT INTO channels (id, title, handle, description, subscriber_count, view_count, video_count, avatar_url, imported_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
+     ON CONFLICT(id) DO UPDATE SET
+       title = COALESCE(excluded.title, channels.title),
+       handle = COALESCE(excluded.handle, channels.handle),
+       description = COALESCE(excluded.description, channels.description),
+       subscriber_count = COALESCE(excluded.subscriber_count, channels.subscriber_count),
+       view_count = COALESCE(excluded.view_count, channels.view_count),
+       video_count = COALESCE(excluded.video_count, channels.video_count),
+       avatar_url = COALESCE(excluded.avatar_url, channels.avatar_url),
+       imported_at = excluded.imported_at`
+  ).run(
+    c.id,
+    c.title ?? null,
+    c.handle ?? null,
+    c.description ?? null,
+    c.subscriber_count ?? null,
+    c.view_count ?? null,
+    c.video_count ?? null,
+    c.avatar_url ?? null
+  );
+}
+
+export function upsertVideo(v: Partial<Video> & { id: string; title: string }): void {
+  db.prepare(
+    `INSERT INTO videos (id, channel_id, title, description, published_at, duration_seconds, views, likes, comments, thumbnail_url, tags, imported_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
+     ON CONFLICT(id) DO UPDATE SET
+       channel_id = COALESCE(excluded.channel_id, videos.channel_id),
+       title = excluded.title,
+       description = COALESCE(excluded.description, videos.description),
+       published_at = COALESCE(excluded.published_at, videos.published_at),
+       duration_seconds = COALESCE(excluded.duration_seconds, videos.duration_seconds),
+       views = COALESCE(excluded.views, videos.views),
+       likes = COALESCE(excluded.likes, videos.likes),
+       comments = COALESCE(excluded.comments, videos.comments),
+       thumbnail_url = COALESCE(excluded.thumbnail_url, videos.thumbnail_url),
+       tags = COALESCE(excluded.tags, videos.tags),
+       imported_at = excluded.imported_at`
+  ).run(
+    v.id,
+    v.channel_id ?? null,
+    v.title,
+    v.description ?? null,
+    v.published_at ?? null,
+    v.duration_seconds ?? null,
+    v.views ?? 0,
+    v.likes ?? 0,
+    v.comments ?? 0,
+    v.thumbnail_url ?? null,
+    v.tags ?? null
+  );
+}
+
+export function getChannel(channelId?: string | null): Channel | undefined {
+  // Returns the *active* channel by default — the one most pages of the
+  // UI scope to. When `channelId` is supplied (e.g. /channel-info?focus=X
+  // wants a specific channel's data regardless of the active pointer),
+  // use that id instead. When `channelId` is supplied but unknown,
+  // return undefined rather than silently falling back to active — the
+  // caller asked for a specific channel and we shouldn't substitute.
+  if (channelId) {
+    return (
+      (db.prepare(`SELECT * FROM channels WHERE id = ?`).get(channelId) as
+        | Channel
+        | undefined) ?? undefined
+    );
+  }
+  const activeId = getActiveChannelId();
+  if (activeId) {
+    const row = db
+      .prepare(`SELECT * FROM channels WHERE id = ?`)
+      .get(activeId) as Channel | undefined;
+    if (row) return row;
+  }
+  // Final fallback (no id passed AND no active pointer): most recent
+  // import. Covers fresh installs / pre-multi-channel data.
+  return db
+    .prepare(`SELECT * FROM channels ORDER BY imported_at DESC LIMIT 1`)
+    .get() as Channel | undefined;
+}
+
+/** All channels stored locally — used by the channel switcher dropdown
+ * and the multi-channel earnings aggregator. Most recently imported first. */
+export function listAllChannels(): Channel[] {
+  return db
+    .prepare(`SELECT * FROM channels ORDER BY imported_at DESC`)
+    .all() as Channel[];
+}
+
+/** Read the ISO-8601 timestamp of the last silent video sync for a channel,
+ * or null if never synced. Drives the 15-minute throttle in
+ * /api/sync/user-videos. */
+export function getLastUserVideosSyncAt(channelId: string): string | null {
+  const row = db
+    .prepare(`SELECT last_user_videos_sync_at FROM channels WHERE id = ?`)
+    .get(channelId) as { last_user_videos_sync_at: string | null } | undefined;
+  return row?.last_user_videos_sync_at ?? null;
+}
+
+export function setLastUserVideosSyncAt(channelId: string, iso: string): void {
+  db.prepare(`UPDATE channels SET last_user_videos_sync_at = ? WHERE id = ?`)
+    .run(iso, channelId);
+}
+
+/**
+ * Active channel id — the one user-facing screens scope to. Single source
+ * of truth for "which channel are we currently looking at". Persisted in
+ * settings under `youtube.activeChannelId`.
+ *
+ * Backward compatibility: pre-multi-channel installs only had
+ * `youtube.channelId` (the single bound channel). We fall back to that
+ * if no explicit active pointer is set, so existing deployments don't
+ * suddenly show "no channel".
+ */
+export function getActiveChannelId(): string | null {
+  const explicit = getSetting("youtube.activeChannelId");
+  if (explicit) return explicit;
+  return getSetting("youtube.channelId");
+}
+
+export function setActiveChannelId(id: string): void {
+  setSetting("youtube.activeChannelId", id);
+  // Keep the legacy key in sync so any code still reading
+  // `youtube.channelId` (analytics endpoints, sync route) sees the same
+  // value. Cheap belt-and-braces.
+  setSetting("youtube.channelId", id);
+}
+
+/**
+ * Delete a single channel and every row that scopes to it: videos
+ * (cascades to comments via FK), comments_fts shadow, cached analytics.
+ * If the deleted channel was active, repoint to whichever channel was
+ * imported most recently (or clear the pointer if none remain).
+ *
+ * Returns counts so the caller can surface "removed N videos" in UI.
+ */
+export function removeChannel(channelId: string): {
+  videos: number;
+  comments: number;
+} {
+  const tx = db.transaction((id: string) => {
+    const doomed = db
+      .prepare(`SELECT id FROM videos WHERE channel_id = ?`)
+      .all(id) as { id: string }[];
+
+    let commentCount = 0;
+    if (doomed.length > 0) {
+      const ids = doomed.map((r) => r.id);
+      const placeholders = ids.map(() => "?").join(",");
+
+      try {
+        db.prepare(
+          `DELETE FROM comments_fts WHERE video_id IN (${placeholders})`
+        ).run(...ids);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn("[removeChannel] comments_fts cleanup failed (continuing):", err);
+      }
+
+      commentCount = (
+        db
+          .prepare(
+            `SELECT COUNT(*) as n FROM comments WHERE video_id IN (${placeholders})`
+          )
+          .get(...ids) as { n: number }
+      ).n;
+
+      db.prepare(`DELETE FROM videos WHERE channel_id = ?`).run(id);
+    }
+
+    db.prepare(`DELETE FROM channels WHERE id = ?`).run(id);
+
+    // Snapshots aren't FK-linked; clean them up explicitly so a
+    // re-imported channel doesn't see stale velocity data.
+    if (doomed.length > 0) {
+      const ids = doomed.map((r) => r.id);
+      const placeholders = ids.map(() => "?").join(",");
+      db.prepare(
+        `DELETE FROM video_view_snapshots WHERE video_id IN (${placeholders})`
+      ).run(...ids);
+    }
+
+    // Per-channel settings — wipe everything keyed by the deleted
+    // channel id so we don't leave dangling OAuth tokens / editor rate
+    // / revenueAccess flags / channelInput tied to a channel that no
+    // longer exists.
+    db.prepare(`DELETE FROM settings WHERE key LIKE ?`).run(`%.${id}`);
+
+    // Bust analytics cache (keyed by channel id).
+    db.prepare(`DELETE FROM api_cache WHERE cache_key LIKE ?`).run(
+      `analytics.%.${id}.%`
+    );
+
+    // Re-point active channel if we just removed it.
+    if (getSetting("youtube.activeChannelId") === id || getSetting("youtube.channelId") === id) {
+      const next = db
+        .prepare(`SELECT id FROM channels ORDER BY imported_at DESC LIMIT 1`)
+        .get() as { id: string } | undefined;
+      if (next?.id) {
+        setSetting("youtube.activeChannelId", next.id);
+        setSetting("youtube.channelId", next.id);
+      } else {
+        setSetting("youtube.activeChannelId", "");
+        setSetting("youtube.channelId", "");
+      }
+    }
+
+    return {
+      videos: doomed.length,
+      comments: commentCount,
+    };
+  });
+  return tx(channelId);
+}
+
+/**
+ * Wipe every video (and its cascading comments / FTS rows) that
+ * doesn't belong to `keepChannelId`. Called at the start of a sync when the
+ * user binds a different channel than the one currently in `settings`.
+ *
+ * Why this exists: `listVideos`, `dashboardAggregates`, the SQL tool, the chat
+ * picker — they all query `SELECT * FROM videos` with no channel filter. So
+ * without this purge, a fresh sync of channel B leaves channel A's rows
+ * hanging around and polluting every listing.
+ *
+ * The `comments_fts` table isn't FK-linked, so ON DELETE CASCADE from
+ * `videos` doesn't reach it — we clean it explicitly.
+ *
+ * Returns counts so callers can surface a "cleaned up N old videos" status.
+ */
+export function purgeOtherChannels(keepChannelId: string): {
+  videos: number;
+  comments: number;
+  channels: number;
+} {
+  const tx = db.transaction((keepId: string) => {
+    // 1. Find every video that will be deleted — we need their ids to clean
+    //    the FTS tables (which aren't FK-linked so no CASCADE).
+    const doomed = db
+      .prepare(
+        `SELECT id FROM videos WHERE channel_id IS NULL OR channel_id != ?`
+      )
+      .all(keepId) as { id: string }[];
+
+    if (doomed.length === 0) {
+      // Still purge orphaned channel rows, then exit early.
+      const chInfo = db
+        .prepare(`DELETE FROM channels WHERE id != ?`)
+        .run(keepId);
+      return { videos: 0, comments: 0, channels: chInfo.changes };
+    }
+
+    const ids = doomed.map((r) => r.id);
+    const placeholders = ids.map(() => "?").join(",");
+
+    // 2. Clean the FTS shadow table for comments (standalone FTS5, we own
+    //    its content). Wrap in try/catch — if the FTS index is malformed
+    //    we'd rather log and keep going than abort the whole channel
+    //    switch and leave the user staring at a "malformed" error.
+    try {
+      db.prepare(
+        `DELETE FROM comments_fts WHERE video_id IN (${placeholders})`
+      ).run(...ids);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn("[purgeOtherChannels] comments_fts cleanup failed (continuing):", err);
+    }
+
+    // 3. Count what will cascade so we can report it (the DELETE on videos
+    //    below triggers ON DELETE CASCADE for comments).
+    const commentCount = db
+      .prepare(
+        `SELECT COUNT(*) as n FROM comments WHERE video_id IN (${placeholders})`
+      )
+      .get(...ids) as { n: number };
+
+    // 4. Delete the videos — FK cascade handles comments.
+    const vidInfo = db
+      .prepare(
+        `DELETE FROM videos WHERE channel_id IS NULL OR channel_id != ?`
+      )
+      .run(keepId);
+
+    // 5. Orphan channel rows (any channel row that isn't the current one).
+    const chInfo = db
+      .prepare(`DELETE FROM channels WHERE id != ?`)
+      .run(keepId);
+
+    // 6. Invalidate any cached YouTube Analytics responses — they're keyed
+    //    by channel id so old entries become orphan dead weight after a
+    //    channel switch. Cheaper to wipe anything `analytics.*` than to
+    //    selectively delete by previous channel id (we don't track it).
+    db.prepare(`DELETE FROM api_cache WHERE cache_key LIKE 'analytics.%'`).run();
+
+    return {
+      videos: vidInfo.changes,
+      comments: commentCount.n,
+      channels: chInfo.changes,
+    };
+  });
+
+  return tx(keepChannelId);
+}
+
+export function listVideos(opts: { limit?: number; search?: string } = {}): Video[] {
+  const limit = opts.limit ?? 200;
+  // Scope to active channel — multi-channel installs would otherwise mix
+  // videos from every connected channel together. If there's no active
+  // channel set, return everything (covers fresh-install state).
+  const activeId = getActiveChannelId();
+  const channelClause = activeId ? "AND channel_id = ?" : "";
+  if (opts.search && opts.search.trim()) {
+    const q = `%${opts.search.trim()}%`;
+    const args = activeId ? [q, q, activeId, limit] : [q, q, limit];
+    return db
+      .prepare(
+        `SELECT * FROM videos
+         WHERE (title LIKE ? OR description LIKE ?) ${channelClause}
+         ORDER BY COALESCE(published_at, imported_at) DESC
+         LIMIT ?`
+      )
+      .all(...args) as Video[];
+  }
+  const args = activeId ? [activeId, limit] : [limit];
+  return db
+    .prepare(
+      `SELECT * FROM videos
+       ${activeId ? "WHERE channel_id = ?" : ""}
+       ORDER BY COALESCE(published_at, imported_at) DESC
+       LIMIT ?`
+    )
+    .all(...args) as Video[];
+}
+
+/**
+ * T4 — "list_my_winners" chat tool source. Top-N own-channel videos
+ * within a window, ranked by multiplier (views/own-channel median) DESC.
+ * Used by the Research/Ideate modes so the agent can ground every
+ * recommendation in the user's own historical evidence — "you tried X
+ * before and it hit hard / underperformed".
+ *
+ * Median computed inline so the SQL stays self-contained; validate-idea
+ * exports the same helper for the per-idea catalog-comparison block
+ * (T5).
+ */
+export type MyWinnerRow = {
+  videoId: string;
+  title: string;
+  thumbnailUrl: string | null;
+  views: number;
+  channelMedian: number;
+  multiplier: number;
+  publishedAt: number | null;
+  likes: number;
+  comments: number;
+};
+
+export function listMyWinners(
+  channelId: string,
+  opts: { limit?: number; lookbackDays?: number; minMultiplier?: number } = {}
+): MyWinnerRow[] {
+  const limit = Math.max(1, Math.min(100, opts.limit ?? 20));
+  const lookbackDays = Math.max(7, Math.min(3650, opts.lookbackDays ?? 365));
+  const minMult = Math.max(0, opts.minMultiplier ?? 1.5);
+
+  const medianRow = db
+    .prepare(
+      `WITH ordered AS (
+         SELECT views,
+                ROW_NUMBER() OVER (ORDER BY views) AS rn,
+                COUNT(*)     OVER ()              AS cnt
+         FROM videos
+         WHERE channel_id = ?
+           AND views > 0
+       )
+       SELECT AVG(views) AS median
+       FROM ordered
+       WHERE rn IN ((cnt + 1) / 2, (cnt + 2) / 2)`
+    )
+    .get(channelId) as { median: number | null } | undefined;
+  const median = Math.round(medianRow?.median ?? 0);
+  if (median === 0) return [];
+
+  const rows = db
+    .prepare(
+      `SELECT id, title, thumbnail_url,
+              COALESCE(views, 0) AS views,
+              COALESCE(likes, 0) AS likes,
+              COALESCE(comments, 0) AS comments,
+              published_at,
+              (COALESCE(views, 0) * 1.0 / ?) AS multiplier
+       FROM videos
+       WHERE channel_id = ?
+         AND published_at IS NOT NULL
+         AND published_at >= strftime('%s','now') - ? * 86400
+         AND views > ? * ?
+       ORDER BY multiplier DESC, views DESC
+       LIMIT ?`
+    )
+    .all(median, channelId, lookbackDays, minMult, median, limit) as Array<{
+    id: string;
+    title: string;
+    thumbnail_url: string | null;
+    views: number;
+    likes: number;
+    comments: number;
+    published_at: number | null;
+    multiplier: number;
+  }>;
+
+  return rows.map((r) => ({
+    videoId: r.id,
+    title: r.title,
+    thumbnailUrl: r.thumbnail_url,
+    views: r.views,
+    channelMedian: median,
+    multiplier: Number(r.multiplier.toFixed(2)),
+    publishedAt: r.published_at,
+    likes: r.likes,
+    comments: r.comments,
+  }));
+}
+
+export type VideoSort = "recent" | "oldest" | "views" | "likes" | "comments" | "engagement";
+export type DurationFilter = "all" | "short" | "long";
+
+/**
+ * Advanced listing with sort + duration filter.
+ * - engagement = (likes + comments) / max(views, 1)
+ * - short  = duration <= 60s (YouTube Shorts)
+ * - long   = duration > 60s
+ */
+export function listVideosAdvanced(opts: {
+  limit?: number;
+  search?: string;
+  sort?: VideoSort;
+  duration?: DurationFilter;
+} = {}): Video[] {
+  const limit = Math.min(500, Math.max(1, opts.limit ?? 200));
+  const where: string[] = [];
+  const args: unknown[] = [];
+
+  // Scope to active channel for multi-channel installs.
+  const activeId = getActiveChannelId();
+  if (activeId) {
+    where.push("channel_id = ?");
+    args.push(activeId);
+  }
+
+  if (opts.search && opts.search.trim()) {
+    where.push("(title LIKE ? OR description LIKE ?)");
+    const q = `%${opts.search.trim()}%`;
+    args.push(q, q);
+  }
+  if (opts.duration === "short") where.push("duration_seconds IS NOT NULL AND duration_seconds <= 60");
+  else if (opts.duration === "long") where.push("(duration_seconds IS NULL OR duration_seconds > 60)");
+
+  let order = "COALESCE(published_at, imported_at) DESC";
+  switch (opts.sort) {
+    case "oldest":
+      order = "COALESCE(published_at, imported_at) ASC";
+      break;
+    case "views":
+      order = "views DESC";
+      break;
+    case "likes":
+      order = "likes DESC";
+      break;
+    case "comments":
+      order = "comments DESC";
+      break;
+    case "engagement":
+      order = "(CAST(likes + comments AS REAL) / MAX(views, 1)) DESC";
+      break;
+    case "recent":
+    default:
+      break;
+  }
+
+  const sql = `SELECT * FROM videos ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY ${order} LIMIT ?`;
+  args.push(limit);
+  return db.prepare(sql).all(...args) as Video[];
+}
+
+/** Lightweight list used by the chat attachment picker. No description payload. */
+export function searchVideosLite(q: string, limit = 20): {
+  id: string; title: string; views: number; likes: number;
+  published_at: number | null; thumbnail_url: string | null; duration_seconds: number | null;
+}[] {
+  const like = `%${q.trim()}%`;
+  const activeId = getActiveChannelId();
+  if (!q.trim()) {
+    if (activeId) {
+      return db.prepare(
+        `SELECT id, title, views, likes, published_at, thumbnail_url, duration_seconds
+         FROM videos WHERE channel_id = ?
+         ORDER BY COALESCE(published_at, imported_at) DESC LIMIT ?`
+      ).all(activeId, limit) as never;
+    }
+    return db.prepare(
+      `SELECT id, title, views, likes, published_at, thumbnail_url, duration_seconds
+       FROM videos ORDER BY COALESCE(published_at, imported_at) DESC LIMIT ?`
+    ).all(limit) as never;
+  }
+  if (activeId) {
+    return db.prepare(
+      `SELECT id, title, views, likes, published_at, thumbnail_url, duration_seconds
+       FROM videos WHERE (title LIKE ? OR description LIKE ?) AND channel_id = ?
+       ORDER BY COALESCE(published_at, imported_at) DESC LIMIT ?`
+    ).all(like, like, activeId, limit) as never;
+  }
+  return db.prepare(
+    `SELECT id, title, views, likes, published_at, thumbnail_url, duration_seconds
+     FROM videos WHERE title LIKE ? OR description LIKE ?
+     ORDER BY COALESCE(published_at, imported_at) DESC LIMIT ?`
+  ).all(like, like, limit) as never;
+}
+
+/** Aggregates for the dashboard: top/bottom performers + outliers. */
+export function dashboardAggregates(): {
+  topByViews: Video[];
+  topByEngagement: (Video & { engagement: number })[];
+  bottomByViews: Video[];
+  outliers: (Video & { zscore: number })[];
+  byMonth: { month: string; count: number; views: number }[];
+} {
+  // Scope to the active channel — Dashboard widgets must reflect the channel
+  // the user is currently viewing in the switcher, not a mash-up of every
+  // connected channel. (Pre-multi-channel installs have no active id and
+  // see all videos, which is the same behaviour as before.)
+  const activeId = getActiveChannelId();
+  const allVideos = (
+    activeId
+      ? db.prepare(`SELECT * FROM videos WHERE channel_id = ?`).all(activeId)
+      : db.prepare(`SELECT * FROM videos`).all()
+  ) as Video[];
+  const total = allVideos.length;
+  if (total === 0) {
+    return { topByViews: [], topByEngagement: [], bottomByViews: [], outliers: [], byMonth: [] };
+  }
+
+  const topByViews = [...allVideos].sort((a, b) => b.views - a.views).slice(0, 5);
+  const bottomByViews = [...allVideos]
+    .filter((v) => v.views > 0)
+    .sort((a, b) => a.views - b.views)
+    .slice(0, 5);
+  const topByEngagement = allVideos
+    .map((v) => ({ ...v, engagement: (v.likes + v.comments) / Math.max(v.views, 1) }))
+    .sort((a, b) => b.engagement - a.engagement)
+    .slice(0, 5);
+
+  // Z-score over views. Videos with |z| >= 2 are outliers.
+  const mean = allVideos.reduce((s, v) => s + v.views, 0) / total;
+  const variance = allVideos.reduce((s, v) => s + (v.views - mean) ** 2, 0) / total;
+  const std = Math.sqrt(variance) || 1;
+  const outliers = allVideos
+    .map((v) => ({ ...v, zscore: (v.views - mean) / std }))
+    .filter((v) => Math.abs(v.zscore) >= 2)
+    .sort((a, b) => Math.abs(b.zscore) - Math.abs(a.zscore))
+    .slice(0, 10);
+
+  // Monthly rollup over the last 18 months.
+  const monthMap = new Map<string, { count: number; views: number }>();
+  for (const v of allVideos) {
+    if (!v.published_at) continue;
+    const d = new Date(v.published_at * 1000);
+    const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+    const cur = monthMap.get(key) ?? { count: 0, views: 0 };
+    cur.count += 1;
+    cur.views += v.views;
+    monthMap.set(key, cur);
+  }
+  const byMonth = [...monthMap.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .slice(-18)
+    .map(([month, v]) => ({ month, ...v }));
+
+  return { topByViews, topByEngagement, bottomByViews, outliers, byMonth };
+}
+
+/* ---------- App logs (observability) ----------
+ * Declared at module scope (not inside initSchema) so the table is guaranteed
+ * to exist even when the better-sqlite3 handle is cached on `global.__sqlite`
+ * across Next.js hot reloads. initSchema only runs on the very first import;
+ * module-level db.exec runs every import, which is what we want for schema
+ * added in later patches. */
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS app_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    level TEXT NOT NULL,
+    source TEXT NOT NULL,
+    message TEXT NOT NULL,
+    context TEXT,
+    stack TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_logs_ts ON app_logs(ts DESC);
+  CREATE INDEX IF NOT EXISTS idx_logs_level ON app_logs(level);
+  CREATE INDEX IF NOT EXISTS idx_logs_source ON app_logs(source);
+`);
+
+/* ---------- AI usage ledger ---------- */
+// Declared at module scope for the same reason as app_logs — survives hot
+// reloads and ensures a newly-added integration always has its tables.
+
+db.exec(`
+  -- Per-turn AI spend ledger. One row = one model call or chat turn.
+  -- Tracks tokens separately for executor and advisor so we can see where
+  -- the money actually goes. Cost in
+  -- millicents (1/1000 of a cent) for precision — at Sonnet rates a tiny
+  -- 500-token turn rounds down to 0 cents otherwise.
+  CREATE TABLE IF NOT EXISTS claude_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT,
+    ts INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    provider TEXT NOT NULL DEFAULT 'anthropic',
+    executor_model TEXT NOT NULL,
+    advisor_model TEXT,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    advisor_input_tokens INTEGER NOT NULL DEFAULT 0,
+    advisor_output_tokens INTEGER NOT NULL DEFAULT 0,
+    advisor_calls INTEGER NOT NULL DEFAULT 0,
+    cost_millicents INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    iterations INTEGER NOT NULL DEFAULT 0,
+    first_user_msg TEXT,
+    active_tools TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_claude_usage_ts ON claude_usage(ts DESC);
+  CREATE INDEX IF NOT EXISTS idx_claude_usage_session ON claude_usage(session_id);
+
+  -- Per-video stat snapshots used by the alerts feature. Each poll
+  -- inserts one row per monitored video; the rule engine compares the
+  -- latest row to a prior one to compute deltas / velocities. Snapshots
+  -- older than 7 days are auto-trimmed. (Originally views-only - likes
+  -- and comments were added when alerts went rule-based; the migration
+  -- below ALTERs the table on existing installs.)
+  CREATE TABLE IF NOT EXISTS video_view_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id TEXT NOT NULL,
+    ts INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    views INTEGER NOT NULL,
+    likes INTEGER,
+    comments INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_view_snapshots_video_ts ON video_view_snapshots(video_id, ts DESC);
+`);
+
+try {
+  const usageCols = db
+    .prepare(`PRAGMA table_info(claude_usage)`)
+    .all() as { name: string }[];
+  if (usageCols.length && !usageCols.some((c) => c.name === "provider")) {
+    db.exec(`ALTER TABLE claude_usage ADD COLUMN provider TEXT NOT NULL DEFAULT 'anthropic'`);
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_claude_usage_provider ON claude_usage(provider, ts DESC)`);
+} catch {
+  /* noop */
+}
+
+// Backfill the snapshot table on existing installs — they pre-date the
+// likes/comments columns, so SQLite would 500 on the new INSERT shape.
+// Best-effort: if either ALTER fails (column already exists, table
+// doesn't exist yet on a brand-new install), we log and move on.
+{
+  const cols = db
+    .prepare(`PRAGMA table_info(video_view_snapshots)`)
+    .all() as { name: string }[];
+  const have = new Set(cols.map((c) => c.name));
+  if (cols.length && !have.has("likes")) {
+    try {
+      db.exec(`ALTER TABLE video_view_snapshots ADD COLUMN likes INTEGER`);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn("[db] add likes column to snapshots failed (ignored):", err);
+    }
+  }
+  if (cols.length && !have.has("comments")) {
+    try {
+      db.exec(`ALTER TABLE video_view_snapshots ADD COLUMN comments INTEGER`);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn("[db] add comments column to snapshots failed (ignored):", err);
+    }
+  }
+}
+
+// Per-channel attribute columns (editor name, CMS network info,
+// monetization status, free-form notes). These are user-managed
+// metadata layered on top of the channels table — set via the
+// /integrations channel row "Edit" expansion. Idempotent migration:
+// each ALTER is wrapped in try/catch so re-runs (or running on a
+// fresh install where the columns already exist via CREATE TABLE)
+// are no-ops.
+{
+  const channelCols = (
+    db.prepare(`PRAGMA table_info(channels)`).all() as { name: string }[]
+  ).map((c) => c.name);
+  const newColumns: { name: string; type: string; default?: string }[] = [
+    // Who edits videos for this channel — used by the editor billing
+    // card to group "you owe John X, you owe Anna Y".
+    { name: "editor_name", type: "TEXT" },
+    // CMS / MCN that owns the channel (e.g. "Freedom!", "Spotter").
+    // Used to group cross-channel earnings by network and to apply
+    // the network's revenue cut.
+    { name: "cms_name", type: "TEXT" },
+    // Percentage the CMS deducts from gross revenue, 0-50. UI
+    // surfaces "Net after CMS cut" computed as gross * (1 - cut/100).
+    { name: "cms_cut_percent", type: "REAL" },
+    // AdSense account label — informational tag for grouping channels
+    // that share an AdSense account. No revenue math.
+    { name: "adsense_name", type: "TEXT" },
+    // monetized | pending | not_eligible. Drives the dashboard
+    // "Monetized only" / "All" filter and segregates the editor
+    // billing card so non-monetised channels stay visible without
+    // mixing into the revenue widgets.
+    { name: "monetization_status", type: "TEXT" },
+    // Free-form scratchpad — anything the user wants to remember.
+    { name: "notes", type: "TEXT" },
+    // Forecast input for the Editor Billing card. The user agrees an
+    // upload schedule with the editor (e.g. "8 videos a month at $20
+    // each = $160/month forecast"); the dashboard sums this across
+    // every channel for total expected monthly editor cost.
+    { name: "expected_videos_per_month", type: "INTEGER" },
+    // Per-channel context fields edited on /channel-info. Every AI
+    // feature downstream (outliers explainer, topic validator, ideation,
+    // daily market watch, chat) reads these on every invocation, so they
+    // must always be safe to concatenate into a prompt — DEFAULT '' means
+    // existing rows get an empty string immediately and the API never
+    // returns NULL.
+    // Legacy 5-field context model. These columns are NO LONGER read by
+    // any active prompt builder. They remain in schema for backwards
+    // compatibility — the migration below baked their concatenated text
+    // into the new channel_description column. Treat as deprecated;
+    // /channel-info no longer surfaces them.
+    { name: "niche", type: "TEXT", default: "''" },
+    { name: "positioning", type: "TEXT", default: "''" },
+    { name: "audience", type: "TEXT", default: "''" },
+    { name: "voice", type: "TEXT", default: "''" },
+    { name: "external_sources", type: "TEXT", default: "''" },
+    // T9 — HAmo-authored hard-enforcement rules injected verbatim into
+    // the ideation compose prompt. Same DEFAULT '' contract as the
+    // other context fields so the prompt builder never sees NULL.
+    { name: "ideation_rules", type: "TEXT", default: "''" },
+    // T1 of the channel-description redesign: one paragraph that
+    // replaces niche/positioning/audience/voice/external_sources for
+    // every downstream agent. ≤1500 chars after trim. Edited via the
+    // /channel-info Description field and the /chat Brain panel.
+    { name: "channel_description", type: "TEXT", default: "''" },
+  ];
+  for (const col of newColumns) {
+    if (channelCols.includes(col.name)) continue;
+    try {
+      const def = col.default ? ` NOT NULL DEFAULT ${col.default}` : "";
+      db.exec(`ALTER TABLE channels ADD COLUMN ${col.name} ${col.type}${def}`);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[db] add channels.${col.name} failed (ignored):`,
+        err
+      );
+    }
+  }
+}
+
+// One-shot migration for the channel_description redesign. For each
+// existing channel where description is still empty but at least one of
+// the legacy 5 fields has content, concatenate them with paragraph
+// breaks, truncate at the last sentence boundary before 1500 chars
+// (fall back to hard char truncate if no boundary found), and write to
+// channel_description. Idempotent via the settings flag.
+{
+  const FLAG = "channels.description_migrated_v1";
+  if (getSetting(FLAG) !== "1") {
+    try {
+      type Row = {
+        id: string;
+        channel_description: string | null;
+        niche: string | null;
+        positioning: string | null;
+        audience: string | null;
+        voice: string | null;
+        external_sources: string | null;
+      };
+      const rows = db
+        .prepare(
+          `SELECT id, channel_description, niche, positioning, audience, voice, external_sources
+           FROM channels`
+        )
+        .all() as Row[];
+      const upd = db.prepare(
+        `UPDATE channels SET channel_description = ? WHERE id = ?`
+      );
+      const CAP = 1500;
+      let migrated = 0;
+      for (const r of rows) {
+        if ((r.channel_description ?? "").trim().length > 0) continue;
+        const parts = [r.niche, r.positioning, r.audience, r.voice, r.external_sources]
+          .map((s) => (s ?? "").trim())
+          .filter((s) => s.length > 0);
+        if (parts.length === 0) continue;
+        let combined = parts.join("\n\n");
+        if (combined.length > CAP) {
+          const slice = combined.slice(0, CAP);
+          // Prefer the last sentence-ending punctuation before the cap.
+          const lastDot = Math.max(
+            slice.lastIndexOf("."),
+            slice.lastIndexOf("!"),
+            slice.lastIndexOf("?")
+          );
+          combined =
+            lastDot >= CAP - 300
+              ? `${slice.slice(0, lastDot + 1)}…`
+              : `${slice.trimEnd()}…`;
+        }
+        upd.run(combined, r.id);
+        migrated++;
+      }
+      setSetting(FLAG, "1");
+      if (migrated > 0) {
+        // eslint-disable-next-line no-console
+        console.info(
+          `[db] channel_description migration: populated ${migrated} channels from legacy fields`
+        );
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn("[db] channel_description migration failed (will retry next boot):", err);
+    }
+  }
+}
+
+// Tags + channel_tags m:n. Replaces the old per-channel cms_name /
+// adsense_name columns with a flexible, multi-tag-per-channel system:
+// "tags you can put on each channel, and a %, that group them into
+// batches" — friend's actual ask. A tag can optionally carry a
+// `cut_percent` so the dashboard can compute net-after-cut for any
+// channel tagged with it (CMS networks, AdSense-tier deals, etc).
+// Tags without a cut are just labels (genre, language, internal
+// grouping, "monetised content network", etc).
+db.exec(`
+  CREATE TABLE IF NOT EXISTS tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    cut_percent REAL,
+    color TEXT,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS channel_tags (
+    channel_id TEXT NOT NULL,
+    tag_id INTEGER NOT NULL,
+    PRIMARY KEY (channel_id, tag_id),
+    FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+    FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_channel_tags_channel ON channel_tags(channel_id);
+  CREATE INDEX IF NOT EXISTS idx_channel_tags_tag ON channel_tags(tag_id);
+`);
+
+// Teams — user grouping labels (Designer, Editor, Ops, etc.).
+// Mirrors the tags/channel_tags m:n model but scoped to Supabase user IDs.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS teams (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    color TEXT,
+    description TEXT,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS user_teams (
+    user_id TEXT NOT NULL,
+    team_id INTEGER NOT NULL,
+    assigned_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (user_id, team_id),
+    FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_user_teams_user ON user_teams(user_id);
+  CREATE INDEX IF NOT EXISTS idx_user_teams_team ON user_teams(team_id);
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS boards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT,
+    color TEXT,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS board_columns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    board_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    color TEXT,
+    position INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    FOREIGN KEY (board_id) REFERENCES boards(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_board_columns_board ON board_columns(board_id, position);
+
+  CREATE TABLE IF NOT EXISTS board_cards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    board_id INTEGER NOT NULL,
+    column_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    content_notes TEXT,
+    thumbnail_url TEXT,
+    platform TEXT,
+    due_date INTEGER,
+    priority TEXT NOT NULL DEFAULT 'medium' CHECK (priority IN ('low','medium','high','urgent')),
+    position INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    FOREIGN KEY (board_id) REFERENCES boards(id) ON DELETE CASCADE,
+    FOREIGN KEY (column_id) REFERENCES board_columns(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_board_cards_column ON board_cards(column_id, position);
+  CREATE INDEX IF NOT EXISTS idx_board_cards_board ON board_cards(board_id);
+
+  CREATE TABLE IF NOT EXISTS card_assignees (
+    card_id INTEGER NOT NULL,
+    user_id TEXT NOT NULL,
+    assigned_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (card_id, user_id),
+    FOREIGN KEY (card_id) REFERENCES board_cards(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_card_assignees_card ON card_assignees(card_id);
+  CREATE INDEX IF NOT EXISTS idx_card_assignees_user ON card_assignees(user_id);
+
+  CREATE TABLE IF NOT EXISTS card_teams (
+    card_id     INTEGER NOT NULL,
+    team_id     INTEGER NOT NULL,
+    assigned_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (card_id, team_id),
+    FOREIGN KEY (card_id) REFERENCES board_cards(id) ON DELETE CASCADE,
+    FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_card_teams_card ON card_teams(card_id);
+  CREATE INDEX IF NOT EXISTS idx_card_teams_team ON card_teams(team_id);
+`);
+
+// Migrate existing board_cards tables that pre-date the thumbnail_url column.
+{
+  const cols = (db.prepare("PRAGMA table_info(board_cards)").all() as { name: string }[]).map(c => c.name);
+  if (!cols.includes("thumbnail_url")) {
+    db.prepare("ALTER TABLE board_cards ADD COLUMN thumbnail_url TEXT").run();
+  }
+}
+
+// One-shot migration: lift the legacy cms_name / cms_cut_percent /
+// adsense_name fields (now removed from the UI) into proper tags so
+// existing installs don't lose data. Idempotent via the
+// `tags.legacyMigrated` setting flag.
+{
+  const migrated = getSetting("tags.legacyMigrated") === "1";
+  if (!migrated) {
+    try {
+      const channelsWithMeta = db
+        .prepare(
+          `SELECT id, cms_name, cms_cut_percent, adsense_name
+           FROM channels
+           WHERE cms_name IS NOT NULL OR adsense_name IS NOT NULL`
+        )
+        .all() as {
+          id: string;
+          cms_name: string | null;
+          cms_cut_percent: number | null;
+          adsense_name: string | null;
+        }[];
+      const tx = db.transaction(() => {
+        const upsertTag = db.prepare(
+          `INSERT INTO tags (name, cut_percent)
+           VALUES (?, ?)
+           ON CONFLICT(name) DO UPDATE SET
+             cut_percent = COALESCE(tags.cut_percent, excluded.cut_percent)
+           RETURNING id`
+        );
+        const attach = db.prepare(
+          `INSERT OR IGNORE INTO channel_tags (channel_id, tag_id) VALUES (?, ?)`
+        );
+        for (const c of channelsWithMeta) {
+          if (c.cms_name && c.cms_name.trim()) {
+            const row = upsertTag.get(
+              c.cms_name.trim(),
+              c.cms_cut_percent ?? null
+            ) as { id: number } | undefined;
+            if (row) attach.run(c.id, row.id);
+          }
+          if (c.adsense_name && c.adsense_name.trim()) {
+            const row = upsertTag.get(c.adsense_name.trim(), null) as
+              | { id: number }
+              | undefined;
+            if (row) attach.run(c.id, row.id);
+          }
+        }
+      });
+      tx();
+      setSetting("tags.legacyMigrated", "1");
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn("[db] tags legacy migration failed (ignored):", err);
+    }
+  }
+}
+
+/* ---------- Comments (Phase 2 — schema lives here so SQL tool sees it) ---------- */
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS comments (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL,
+    parent_id TEXT,
+    author TEXT,
+    author_channel_id TEXT,
+    text TEXT NOT NULL,
+    like_count INTEGER DEFAULT 0,
+    reply_count INTEGER DEFAULT 0,
+    published_at INTEGER,
+    updated_at INTEGER,
+    fetched_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_comments_video ON comments(video_id);
+  CREATE INDEX IF NOT EXISTS idx_comments_parent ON comments(parent_id);
+
+  CREATE VIRTUAL TABLE IF NOT EXISTS comments_fts USING fts5(
+    video_id UNINDEXED, comment_id UNINDEXED, author UNINDEXED, text
+  );
+`);
+
+export type Comment = {
+  id: string;
+  video_id: string;
+  parent_id: string | null;
+  author: string | null;
+  author_channel_id: string | null;
+  text: string;
+  like_count: number;
+  reply_count: number;
+  published_at: number | null;
+  updated_at: number | null;
+  fetched_at: number;
+};
+
+export function upsertComment(c: Partial<Comment> & { id: string; video_id: string; text: string }): void {
+  db.prepare(
+    `INSERT INTO comments (id, video_id, parent_id, author, author_channel_id, text, like_count, reply_count, published_at, updated_at, fetched_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
+     ON CONFLICT(id) DO UPDATE SET
+       text = excluded.text,
+       like_count = excluded.like_count,
+       reply_count = excluded.reply_count,
+       updated_at = excluded.updated_at,
+       fetched_at = excluded.fetched_at`
+  ).run(
+    c.id, c.video_id, c.parent_id ?? null, c.author ?? null, c.author_channel_id ?? null,
+    c.text, c.like_count ?? 0, c.reply_count ?? 0, c.published_at ?? null, c.updated_at ?? null
+  );
+  // Keep FTS in sync: remove any stale row for this comment id first, then insert.
+  // Without this, re-syncing the same comment accumulates duplicate FTS rows and
+  // poisons search results.
+  db.prepare(`DELETE FROM comments_fts WHERE comment_id = ?`).run(c.id);
+  db.prepare(
+    `INSERT INTO comments_fts (video_id, comment_id, author, text) VALUES (?, ?, ?, ?)`
+  ).run(c.video_id, c.id, c.author ?? "", c.text);
+}
+
+/**
+ * Upsert many comments in one transaction. Much faster than calling
+ * upsertComment in a loop because we avoid the JS ↔ SQLite round-trip cost
+ * per-row and we only parse/plan the statements once.
+ */
+export function upsertComments(
+  comments: (Partial<Comment> & { id: string; video_id: string; text: string })[]
+): void {
+  const insertMain = db.prepare(
+    `INSERT INTO comments (id, video_id, parent_id, author, author_channel_id, text, like_count, reply_count, published_at, updated_at, fetched_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
+     ON CONFLICT(id) DO UPDATE SET
+       text = excluded.text,
+       like_count = excluded.like_count,
+       reply_count = excluded.reply_count,
+       updated_at = excluded.updated_at,
+       fetched_at = excluded.fetched_at`
+  );
+  const deleteFts = db.prepare(`DELETE FROM comments_fts WHERE comment_id = ?`);
+  const insertFts = db.prepare(
+    `INSERT INTO comments_fts (video_id, comment_id, author, text) VALUES (?, ?, ?, ?)`
+  );
+  const tx = db.transaction(
+    (rows: (Partial<Comment> & { id: string; video_id: string; text: string })[]) => {
+      for (const c of rows) {
+        insertMain.run(
+          c.id, c.video_id, c.parent_id ?? null, c.author ?? null, c.author_channel_id ?? null,
+          c.text, c.like_count ?? 0, c.reply_count ?? 0, c.published_at ?? null, c.updated_at ?? null
+        );
+        deleteFts.run(c.id);
+        insertFts.run(c.video_id, c.id, c.author ?? "", c.text);
+      }
+    }
+  );
+  tx(comments);
+}
+
+export function listTopLevelComments(videoId: string, limit = 50, offset = 0): Comment[] {
+  return db.prepare(
+    `SELECT * FROM comments WHERE video_id = ? AND parent_id IS NULL
+     ORDER BY like_count DESC, published_at DESC LIMIT ? OFFSET ?`
+  ).all(videoId, limit, offset) as Comment[];
+}
+
+export function listReplies(parentId: string): Comment[] {
+  return db.prepare(
+    `SELECT * FROM comments WHERE parent_id = ?
+     ORDER BY published_at ASC`
+  ).all(parentId) as Comment[];
+}
+
+export function getComment(id: string): Comment | undefined {
+  return db.prepare(`SELECT * FROM comments WHERE id = ?`).get(id) as Comment | undefined;
+}
+
+/**
+ * FTS5 search across ALL cached comments. Returns hits with the parent video
+ * title joined in so the caller can show context without a second query.
+ */
+export function searchComments(
+  query: string,
+  limit = 30
+): (Comment & { video_title: string | null })[] {
+  // Escape FTS5 metachars by quoting the whole phrase.
+  const safeQuery = `"${query.replace(/"/g, '""')}"`;
+  // Scope to the active channel — comment hits from a different channel
+  // would just confuse the user reading results in their channel context.
+  const activeId = getActiveChannelId();
+  if (activeId) {
+    return db
+      .prepare(
+        `SELECT c.*, v.title as video_title
+         FROM comments_fts fts
+         JOIN comments c ON c.id = fts.comment_id
+         JOIN videos v ON v.id = c.video_id
+         WHERE comments_fts MATCH ? AND v.channel_id = ?
+         ORDER BY bm25(comments_fts) ASC, c.like_count DESC
+         LIMIT ?`
+      )
+      .all(safeQuery, activeId, limit) as (Comment & { video_title: string | null })[];
+  }
+  return db
+    .prepare(
+      `SELECT c.*, v.title as video_title
+       FROM comments_fts fts
+       JOIN comments c ON c.id = fts.comment_id
+       LEFT JOIN videos v ON v.id = c.video_id
+       WHERE comments_fts MATCH ?
+       ORDER BY bm25(comments_fts) ASC, c.like_count DESC
+       LIMIT ?`
+    )
+    .all(safeQuery, limit) as (Comment & { video_title: string | null })[];
+}
+
+export function commentCount(videoId: string): { total: number; topLevel: number; fetchedAt: number | null } {
+  const row = db.prepare(
+    `SELECT COUNT(*) as total,
+            SUM(CASE WHEN parent_id IS NULL THEN 1 ELSE 0 END) as topLevel,
+            MAX(fetched_at) as fetchedAt
+     FROM comments WHERE video_id = ?`
+  ).get(videoId) as { total: number; topLevel: number; fetchedAt: number | null };
+  return row;
+}
+
+export function getVideo(id: string): Video | undefined {
+  return db
+    .prepare(`SELECT * FROM videos WHERE id = ?`)
+    .get(id) as Video | undefined;
+}
+
+export function videoStats(channelId?: string | null): {
+  total: number;
+  totalViews: number;
+  totalLikes: number;
+  totalComments: number;
+  avgViews: number;
+} {
+  // Headline KPI tiles must reflect the active channel only — otherwise
+  // switching channels wouldn't change the numbers. When `channelId` is
+  // passed explicitly (focus-mode in /channel-info), use that instead.
+  const id = channelId ?? getActiveChannelId();
+  const row = (
+    id
+      ? db
+          .prepare(
+            `SELECT COUNT(*) as total,
+                    COALESCE(SUM(views),0) as totalViews,
+                    COALESCE(SUM(likes),0) as totalLikes,
+                    COALESCE(SUM(comments),0) as totalComments
+             FROM videos WHERE channel_id = ?`
+          )
+          .get(id)
+      : db
+          .prepare(
+            `SELECT COUNT(*) as total,
+                    COALESCE(SUM(views),0) as totalViews,
+                    COALESCE(SUM(likes),0) as totalLikes,
+                    COALESCE(SUM(comments),0) as totalComments
+             FROM videos`
+          )
+          .get()
+  ) as { total: number; totalViews: number; totalLikes: number; totalComments: number };
+  const avgViews = row.total > 0 ? Math.round(row.totalViews / row.total) : 0;
+  return { ...row, avgViews };
+}
+
+/* ---------- Deep channel analytics ---------- */
+
+export type ChannelAnalytics = {
+  core: {
+    total: number;
+    totalViews: number;
+    totalLikes: number;
+    totalComments: number;
+    avgViews: number;
+    medianViews: number;
+    avgLikes: number;
+    avgComments: number;
+    engagementRate: number; // (likes+comments)/views
+    likesPerView: number;
+    commentsPerView: number;
+  };
+  performance: {
+    minViews: number;
+    maxViews: number;
+    medianViews: number;
+    p25Views: number;
+    p75Views: number;
+    stdevViews: number;
+    aboveMedianPct: number;
+    topViralPct: number; // % of subs the best video reached
+  };
+  contentMix: {
+    shorts: { count: number; totalViews: number; avgViews: number };
+    longForm: { count: number; totalViews: number; avgViews: number };
+    durationBuckets: { label: string; count: number; totalViews: number }[];
+  };
+  cadence: {
+    firstUploadTs: number | null;
+    lastUploadTs: number | null;
+    channelAgeDays: number | null;
+    daysSinceLastUpload: number | null;
+    avgDaysBetween: number | null;
+    uploadsLast30d: number;
+    uploadsLast90d: number;
+    activeMonths: number; // months with ≥1 upload since first upload
+    silentMonths: number;
+  };
+  patterns: {
+    byDayOfWeek: { day: number; label: string; count: number; avgViews: number }[];
+    byHour: { hour: number; count: number }[]; // 0-23 UTC
+    byMonth: { month: string; count: number; views: number }[];
+  };
+  themes: {
+    topTags: { tag: string; count: number }[];
+    topTitleWords: { word: string; count: number }[];
+    avgTitleLength: number;
+  };
+  growth: {
+    recent5AvgViews: number | null;
+    previous5AvgViews: number | null;
+    growthPct: number | null;
+    recent10AvgViews: number | null;
+    previous10AvgViews: number | null;
+    trend: "up" | "down" | "flat" | "insufficient-data";
+  };
+};
+
+/**
+ * Compute a rich analytics bundle for the currently bound channel. Pure
+ * aggregation over the `videos` table — no external API calls. Meant for
+ * the Channel Details page where we want to surface everything we can
+ * actually see, not just the 4 headline KPIs.
+ */
+export function channelAnalytics(
+  channelId?: string | null
+): ChannelAnalytics | null {
+  type VideoRow = {
+    id: string;
+    title: string;
+    views: number;
+    likes: number;
+    comments: number;
+    duration_seconds: number | null;
+    published_at: number | null;
+    tags: string | null;
+  };
+  // Scope every aggregate below to the active channel so the deep-analytics
+  // page reflects the channel currently selected in the switcher. When
+  // `channelId` is passed explicitly (focus-mode in /channel-info), use
+  // that instead so the detail widgets follow the URL, not the picker.
+  const id = channelId ?? getActiveChannelId();
+  const videos = (
+    id
+      ? db
+          .prepare(
+            `SELECT id, title, views, likes, comments, duration_seconds, published_at, tags
+             FROM videos WHERE channel_id = ?`
+          )
+          .all(id)
+      : db
+          .prepare(
+            `SELECT id, title, views, likes, comments, duration_seconds, published_at, tags
+             FROM videos`
+          )
+          .all()
+  ) as VideoRow[];
+  if (videos.length === 0) return null;
+
+  const totalViews = videos.reduce((s, v) => s + (v.views ?? 0), 0);
+  const totalLikes = videos.reduce((s, v) => s + (v.likes ?? 0), 0);
+  const totalComments = videos.reduce((s, v) => s + (v.comments ?? 0), 0);
+  const avgViews = Math.round(totalViews / videos.length);
+  const avgLikes = Math.round(totalLikes / videos.length);
+  const avgComments = Math.round(totalComments / videos.length);
+
+  // Percentile helpers
+  const sortedViews = [...videos].map((v) => v.views ?? 0).sort((a, b) => a - b);
+  const pct = (p: number) => {
+    if (sortedViews.length === 0) return 0;
+    const idx = Math.min(sortedViews.length - 1, Math.floor((p / 100) * sortedViews.length));
+    return sortedViews[idx];
+  };
+  const medianViews = pct(50);
+  const p25Views = pct(25);
+  const p75Views = pct(75);
+  const minViews = sortedViews[0] ?? 0;
+  const maxViews = sortedViews[sortedViews.length - 1] ?? 0;
+
+  const mean = totalViews / videos.length;
+  const variance =
+    videos.reduce((s, v) => s + Math.pow((v.views ?? 0) - mean, 2), 0) / videos.length;
+  const stdevViews = Math.round(Math.sqrt(variance));
+
+  const aboveMedianCount = videos.filter((v) => (v.views ?? 0) > medianViews).length;
+  const aboveMedianPct = (aboveMedianCount / videos.length) * 100;
+
+  const ch = getChannel();
+  const topViralPct =
+    ch?.subscriber_count && ch.subscriber_count > 0
+      ? (maxViews / ch.subscriber_count) * 100
+      : 0;
+
+  const engagementRate = totalViews > 0 ? (totalLikes + totalComments) / totalViews : 0;
+  const likesPerView = totalViews > 0 ? totalLikes / totalViews : 0;
+  const commentsPerView = totalViews > 0 ? totalComments / totalViews : 0;
+
+  // Content mix — Shorts (≤60s) vs long-form
+  const shortsArr = videos.filter(
+    (v) => typeof v.duration_seconds === "number" && v.duration_seconds <= 60
+  );
+  const longArr = videos.filter(
+    (v) => !v.duration_seconds || v.duration_seconds > 60
+  );
+  const sumViews = (arr: VideoRow[]) => arr.reduce((s, v) => s + (v.views ?? 0), 0);
+  const avgOf = (arr: VideoRow[]) =>
+    arr.length > 0 ? Math.round(sumViews(arr) / arr.length) : 0;
+
+  const bucketDefs: { label: string; min: number; max: number }[] = [
+    { label: "<1m", min: 0, max: 60 },
+    { label: "1–5m", min: 60, max: 300 },
+    { label: "5–15m", min: 300, max: 900 },
+    { label: "15–30m", min: 900, max: 1800 },
+    { label: "30m+", min: 1800, max: Number.POSITIVE_INFINITY },
+  ];
+  const durationBuckets = bucketDefs.map((b) => {
+    const xs = videos.filter((v) => {
+      const d = v.duration_seconds ?? 0;
+      return d >= b.min && d < b.max;
+    });
+    return { label: b.label, count: xs.length, totalViews: sumViews(xs) };
+  });
+
+  // Cadence
+  const dated = videos
+    .map((v) => v.published_at)
+    .filter((t): t is number => typeof t === "number")
+    .sort((a, b) => a - b);
+  const now = Math.floor(Date.now() / 1000);
+  const firstUploadTs = dated[0] ?? null;
+  const lastUploadTs = dated[dated.length - 1] ?? null;
+  const channelAgeDays = firstUploadTs ? Math.floor((now - firstUploadTs) / 86400) : null;
+  const daysSinceLastUpload = lastUploadTs
+    ? Math.floor((now - lastUploadTs) / 86400)
+    : null;
+  let avgDaysBetween: number | null = null;
+  if (dated.length >= 2) {
+    const totalSpan = dated[dated.length - 1] - dated[0];
+    avgDaysBetween = Math.round(totalSpan / (dated.length - 1) / 86400);
+  }
+  const uploadsLast30d = dated.filter((t) => now - t <= 30 * 86400).length;
+  const uploadsLast90d = dated.filter((t) => now - t <= 90 * 86400).length;
+
+  // Count active (≥1 upload) vs silent months since first upload
+  const monthKeys = new Set<string>();
+  for (const t of dated) {
+    const d = new Date(t * 1000);
+    monthKeys.add(`${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`);
+  }
+  let totalMonths = 0;
+  if (firstUploadTs) {
+    const first = new Date(firstUploadTs * 1000);
+    const nowDate = new Date();
+    totalMonths =
+      (nowDate.getUTCFullYear() - first.getUTCFullYear()) * 12 +
+      (nowDate.getUTCMonth() - first.getUTCMonth()) +
+      1;
+  }
+  const activeMonths = monthKeys.size;
+  const silentMonths = Math.max(0, totalMonths - activeMonths);
+
+  // Patterns
+  const dayLabels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const dowBuckets: { count: number; totalViews: number }[] = Array.from(
+    { length: 7 },
+    () => ({ count: 0, totalViews: 0 })
+  );
+  for (const v of videos) {
+    if (!v.published_at) continue;
+    const d = new Date(v.published_at * 1000);
+    const dow = d.getUTCDay();
+    dowBuckets[dow].count += 1;
+    dowBuckets[dow].totalViews += v.views ?? 0;
+  }
+  const byDayOfWeek = dowBuckets.map((b, day) => ({
+    day,
+    label: dayLabels[day],
+    count: b.count,
+    avgViews: b.count > 0 ? Math.round(b.totalViews / b.count) : 0,
+  }));
+
+  const hourBuckets: number[] = Array.from({ length: 24 }, () => 0);
+  for (const v of videos) {
+    if (!v.published_at) continue;
+    const d = new Date(v.published_at * 1000);
+    hourBuckets[d.getUTCHours()] += 1;
+  }
+  const byHour = hourBuckets.map((count, hour) => ({ hour, count }));
+
+  const monthMap = new Map<string, { count: number; views: number }>();
+  for (const v of videos) {
+    if (!v.published_at) continue;
+    const d = new Date(v.published_at * 1000);
+    const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+    const cur = monthMap.get(key) ?? { count: 0, views: 0 };
+    cur.count += 1;
+    cur.views += v.views ?? 0;
+    monthMap.set(key, cur);
+  }
+  const byMonth = [...monthMap.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([month, v]) => ({ month, ...v }));
+
+  // Themes — tags and title words
+  const tagMap = new Map<string, number>();
+  for (const v of videos) {
+    try {
+      const parsed = JSON.parse(v.tags ?? "[]");
+      if (Array.isArray(parsed)) {
+        for (const tag of parsed) {
+          const t = String(tag).toLowerCase().trim();
+          if (!t) continue;
+          tagMap.set(t, (tagMap.get(t) ?? 0) + 1);
+        }
+      }
+    } catch {
+      /* ignore malformed */
+    }
+  }
+  const topTags = [...tagMap.entries()]
+    .sort(([, a], [, b]) => b - a)
+    .slice(0, 20)
+    .map(([tag, count]) => ({ tag, count }));
+
+  const stopWords = new Set([
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "is",
+    "are", "was", "were", "be", "by", "at", "from", "that", "this", "it", "as",
+    "how", "why", "what", "when", "who", "i", "you", "my", "your", "our", "we",
+    "і", "та", "а", "чи", "як", "до", "з", "на", "по", "від", "що", "це", "цей",
+    "my", "мій", "моя", "my", "most",
+  ]);
+  const wordMap = new Map<string, number>();
+  let totalTitleChars = 0;
+  for (const v of videos) {
+    totalTitleChars += (v.title ?? "").length;
+    const words = (v.title ?? "")
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}\s'-]/gu, " ")
+      .split(/\s+/)
+      .filter((w) => w.length >= 3 && !stopWords.has(w));
+    for (const w of words) {
+      wordMap.set(w, (wordMap.get(w) ?? 0) + 1);
+    }
+  }
+  const topTitleWords = [...wordMap.entries()]
+    .sort(([, a], [, b]) => b - a)
+    .slice(0, 15)
+    .map(([word, count]) => ({ word, count }));
+  const avgTitleLength = Math.round(totalTitleChars / videos.length);
+
+  // Growth trajectory — compare recent vs previous N uploads by published date
+  const publishedSorted = videos
+    .filter((v): v is VideoRow & { published_at: number } => !!v.published_at)
+    .sort((a, b) => b.published_at - a.published_at);
+  const avgN = (arr: typeof publishedSorted) =>
+    arr.length > 0
+      ? Math.round(arr.reduce((s, v) => s + (v.views ?? 0), 0) / arr.length)
+      : null;
+  const recent5AvgViews = avgN(publishedSorted.slice(0, 5));
+  const previous5AvgViews = avgN(publishedSorted.slice(5, 10));
+  const recent10AvgViews = avgN(publishedSorted.slice(0, 10));
+  const previous10AvgViews = avgN(publishedSorted.slice(10, 20));
+  let growthPct: number | null = null;
+  let trend: ChannelAnalytics["growth"]["trend"] = "insufficient-data";
+  if (recent5AvgViews !== null && previous5AvgViews !== null && previous5AvgViews > 0) {
+    growthPct = ((recent5AvgViews - previous5AvgViews) / previous5AvgViews) * 100;
+    trend = Math.abs(growthPct) < 10 ? "flat" : growthPct > 0 ? "up" : "down";
+  } else if (publishedSorted.length < 10) {
+    trend = "insufficient-data";
+  }
+
+  return {
+    core: {
+      total: videos.length,
+      totalViews,
+      totalLikes,
+      totalComments,
+      avgViews,
+      medianViews,
+      avgLikes,
+      avgComments,
+      engagementRate,
+      likesPerView,
+      commentsPerView,
+    },
+    performance: {
+      minViews,
+      maxViews,
+      medianViews,
+      p25Views,
+      p75Views,
+      stdevViews,
+      aboveMedianPct,
+      topViralPct,
+    },
+    contentMix: {
+      shorts: {
+        count: shortsArr.length,
+        totalViews: sumViews(shortsArr),
+        avgViews: avgOf(shortsArr),
+      },
+      longForm: {
+        count: longArr.length,
+        totalViews: sumViews(longArr),
+        avgViews: avgOf(longArr),
+      },
+      durationBuckets,
+    },
+    cadence: {
+      firstUploadTs,
+      lastUploadTs,
+      channelAgeDays,
+      daysSinceLastUpload,
+      avgDaysBetween,
+      uploadsLast30d,
+      uploadsLast90d,
+      activeMonths,
+      silentMonths,
+    },
+    patterns: {
+      byDayOfWeek,
+      byHour,
+      byMonth,
+    },
+    themes: {
+      topTags,
+      topTitleWords,
+      avgTitleLength,
+    },
+    growth: {
+      recent5AvgViews,
+      previous5AvgViews,
+      growthPct,
+      recent10AvgViews,
+      previous10AvgViews,
+      trend,
+    },
+  };
+}
+
+/* ---------- App logs (observability) ---------- */
+
+export type LogLevel = "debug" | "info" | "warn" | "error";
+
+export type AppLog = {
+  id: number;
+  ts: number;
+  level: LogLevel;
+  source: string;
+  message: string;
+  context: string | null;
+  stack: string | null;
+};
+
+const LOG_RETENTION_ROWS = 5000;
+
+export function writeLog(entry: {
+  level: LogLevel;
+  source: string;
+  message: string;
+  context?: unknown;
+  stack?: string | null;
+}): void {
+  const contextJson = (() => {
+    if (entry.context === undefined || entry.context === null) return null;
+    try {
+      return JSON.stringify(entry.context);
+    } catch {
+      // A circular object shouldn't crash the logger — fall back to tagging it.
+      return JSON.stringify({ _serializationError: true });
+    }
+  })();
+  db.prepare(
+    `INSERT INTO app_logs (level, source, message, context, stack)
+     VALUES (?, ?, ?, ?, ?)`
+  ).run(entry.level, entry.source, entry.message, contextJson, entry.stack ?? null);
+
+  // Cheap retention: after every error and occasionally for others, trim the
+  // oldest rows so the table doesn't grow forever.
+  if (entry.level === "error" || Math.random() < 0.02) {
+    db.prepare(
+      `DELETE FROM app_logs WHERE id IN (
+         SELECT id FROM app_logs ORDER BY ts DESC, id DESC LIMIT -1 OFFSET ?
+       )`
+    ).run(LOG_RETENTION_ROWS);
+  }
+}
+
+export function listLogs(opts: {
+  level?: LogLevel | "all";
+  source?: string;
+  search?: string;
+  limit?: number;
+  offset?: number;
+} = {}): AppLog[] {
+  const limit = Math.min(500, Math.max(1, opts.limit ?? 200));
+  const offset = Math.max(0, opts.offset ?? 0);
+  const where: string[] = [];
+  const args: unknown[] = [];
+  if (opts.level && opts.level !== "all") {
+    where.push("level = ?");
+    args.push(opts.level);
+  }
+  if (opts.source && opts.source.trim() && opts.source !== "all") {
+    where.push("source = ?");
+    args.push(opts.source);
+  }
+  if (opts.search && opts.search.trim()) {
+    where.push("(message LIKE ? OR context LIKE ?)");
+    const q = `%${opts.search.trim()}%`;
+    args.push(q, q);
+  }
+  const sql = `SELECT * FROM app_logs ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?`;
+  args.push(limit, offset);
+  return db.prepare(sql).all(...args) as AppLog[];
+}
+
+export function logStats(): {
+  total: number;
+  byLevel: Record<LogLevel, number>;
+  sources: string[];
+  last24hErrors: number;
+} {
+  const total = (db.prepare(`SELECT COUNT(*) as n FROM app_logs`).get() as { n: number }).n;
+  const rows = db
+    .prepare(`SELECT level, COUNT(*) as n FROM app_logs GROUP BY level`)
+    .all() as { level: LogLevel; n: number }[];
+  const byLevel: Record<LogLevel, number> = { debug: 0, info: 0, warn: 0, error: 0 };
+  for (const r of rows) byLevel[r.level] = r.n;
+  const sources = (
+    db.prepare(`SELECT DISTINCT source FROM app_logs ORDER BY source`).all() as {
+      source: string;
+    }[]
+  ).map((r) => r.source);
+  const cutoff = Math.floor(Date.now() / 1000) - 24 * 3600;
+  const last24hErrors = (
+    db.prepare(`SELECT COUNT(*) as n FROM app_logs WHERE level = 'error' AND ts >= ?`).get(cutoff) as {
+      n: number;
+    }
+  ).n;
+  return { total, byLevel, sources, last24hErrors };
+}
+
+/* ---------- Generic API cache ---------- */
+
+/**
+ * Read a cached JSON payload by key. Returns null if missing or expired.
+ * Expired rows are not auto-deleted here — `clearExpiredCache` does that
+ * on a schedule if anyone ever wires it up.
+ */
+export function getCached<T>(key: string): T | null {
+  const row = db
+    .prepare(`SELECT payload, expires_at FROM api_cache WHERE cache_key = ?`)
+    .get(key) as { payload: string; expires_at: number } | undefined;
+  if (!row) return null;
+  if (Math.floor(Date.now() / 1000) >= row.expires_at) return null;
+  try {
+    return JSON.parse(row.payload) as T;
+  } catch {
+    return null;
+  }
+}
+
+export function setCached(key: string, payload: unknown, ttlSeconds: number): void {
+  const expiresAt = Math.floor(Date.now() / 1000) + Math.max(1, ttlSeconds);
+  db.prepare(
+    `INSERT INTO api_cache (cache_key, payload, cached_at, expires_at)
+     VALUES (?, ?, strftime('%s','now'), ?)
+     ON CONFLICT(cache_key) DO UPDATE SET
+       payload = excluded.payload,
+       cached_at = excluded.cached_at,
+       expires_at = excluded.expires_at`
+  ).run(key, JSON.stringify(payload), expiresAt);
+}
+
+export function invalidateCache(keyPrefix: string): number {
+  const info = db.prepare(`DELETE FROM api_cache WHERE cache_key LIKE ?`).run(`${keyPrefix}%`);
+  return info.changes;
+}
+
+/* ---------- Claude usage tracking ---------- */
+
+export type ClaudeUsageRow = {
+  id: number;
+  session_id: string | null;
+  ts: number;
+  provider: string;
+  executor_model: string;
+  advisor_model: string | null;
+  input_tokens: number;
+  output_tokens: number;
+  cache_write_tokens: number;
+  cache_read_tokens: number;
+  advisor_input_tokens: number;
+  advisor_output_tokens: number;
+  advisor_calls: number;
+  cost_millicents: number;
+  duration_ms: number;
+  iterations: number;
+  first_user_msg: string | null;
+  active_tools: string | null;
+};
+
+export type AiUsageRow = ClaudeUsageRow;
+
+export type ImagePlannerStyleProfileRow = {
+  user_channel_id: string;
+  provider: string;
+  model: string;
+  generated_at: string;
+  source_window_days: number;
+  source_video_ids_json: string;
+  profile_json: string;
+};
+
+export function recordClaudeUsage(entry: {
+  sessionId: string | null;
+  provider?: string;
+  executorModel: string;
+  advisorModel: string | null;
+  inputTokens: number;
+  outputTokens: number;
+  cacheWriteTokens: number;
+  cacheReadTokens: number;
+  advisorInputTokens: number;
+  advisorOutputTokens: number;
+  advisorCalls: number;
+  costMillicents: number;
+  durationMs: number;
+  iterations: number;
+  firstUserMsg: string | null;
+  activeTools: string[];
+}): void {
+  db.prepare(
+    `INSERT INTO claude_usage (
+      session_id, provider, executor_model, advisor_model,
+      input_tokens, output_tokens, cache_write_tokens, cache_read_tokens,
+      advisor_input_tokens, advisor_output_tokens, advisor_calls,
+      cost_millicents, duration_ms, iterations,
+      first_user_msg, active_tools
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    entry.sessionId,
+    entry.provider ?? "anthropic",
+    entry.executorModel,
+    entry.advisorModel,
+    entry.inputTokens,
+    entry.outputTokens,
+    entry.cacheWriteTokens,
+    entry.cacheReadTokens,
+    entry.advisorInputTokens,
+    entry.advisorOutputTokens,
+    entry.advisorCalls,
+    entry.costMillicents,
+    entry.durationMs,
+    entry.iterations,
+    entry.firstUserMsg,
+    JSON.stringify(entry.activeTools)
+  );
+}
+
+export function recordAiUsage(entry: Parameters<typeof recordClaudeUsage>[0]): void {
+  recordClaudeUsage(entry);
+}
+
+export function aiUsageStats(opts: { limit?: number } = {}): {
+  totalCostMillicents: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCacheReadTokens: number;
+  turns: number;
+  last24hCostMillicents: number;
+  recent: AiUsageRow[];
+} {
+  const limit = Math.max(1, Math.min(200, opts.limit ?? 50));
+  const agg = db
+    .prepare(
+      `SELECT
+         COALESCE(SUM(cost_millicents),0) as total,
+         COALESCE(SUM(input_tokens),0) as inputT,
+         COALESCE(SUM(output_tokens),0) as outputT,
+         COALESCE(SUM(cache_read_tokens),0) as cacheReadT,
+         COUNT(*) as turns
+       FROM claude_usage`
+    )
+    .get() as {
+    total: number;
+    inputT: number;
+    outputT: number;
+    cacheReadT: number;
+    turns: number;
+  };
+  const cutoff = Math.floor(Date.now() / 1000) - 24 * 3600;
+  const last24h = db
+    .prepare(`SELECT COALESCE(SUM(cost_millicents),0) as total FROM claude_usage WHERE ts >= ?`)
+    .get(cutoff) as { total: number };
+  const recent = db
+    .prepare(`SELECT * FROM claude_usage ORDER BY ts DESC LIMIT ?`)
+    .all(limit) as ClaudeUsageRow[];
+  return {
+    totalCostMillicents: agg.total,
+    totalInputTokens: agg.inputT,
+    totalOutputTokens: agg.outputT,
+    totalCacheReadTokens: agg.cacheReadT,
+    turns: agg.turns,
+    last24hCostMillicents: last24h.total,
+    recent,
+  };
+}
+
+export function claudeUsageStats(opts: { limit?: number } = {}) {
+  return aiUsageStats(opts);
+}
+
+export function getImagePlannerStyleProfile(
+  userChannelId: string
+): ImagePlannerStyleProfileRow | null {
+  return (
+    (db
+      .prepare(
+        `SELECT * FROM image_planner_style_profiles
+         WHERE user_channel_id = ?`
+      )
+      .get(userChannelId) as ImagePlannerStyleProfileRow | undefined) ?? null
+  );
+}
+
+export function upsertImagePlannerStyleProfile(input: {
+  userChannelId: string;
+  provider: string;
+  model: string;
+  sourceWindowDays: number;
+  sourceVideoIds: string[];
+  profile: unknown;
+}): void {
+  db.prepare(
+    `INSERT INTO image_planner_style_profiles (
+       user_channel_id, provider, model, generated_at, source_window_days,
+       source_video_ids_json, profile_json
+     ) VALUES (?, ?, ?, datetime('now'), ?, ?, ?)
+     ON CONFLICT(user_channel_id) DO UPDATE SET
+       provider = excluded.provider,
+       model = excluded.model,
+       generated_at = excluded.generated_at,
+       source_window_days = excluded.source_window_days,
+       source_video_ids_json = excluded.source_video_ids_json,
+       profile_json = excluded.profile_json`
+  ).run(
+    input.userChannelId,
+    input.provider,
+    input.model,
+    input.sourceWindowDays,
+    JSON.stringify(input.sourceVideoIds),
+    JSON.stringify(input.profile)
+  );
+}
+
+export function clearClaudeUsage(): number {
+  const info = db.prepare(`DELETE FROM claude_usage`).run();
+  return info.changes;
+}
+
+export function clearLogs(opts: { level?: LogLevel; olderThanSec?: number } = {}): number {
+  const where: string[] = [];
+  const args: unknown[] = [];
+  if (opts.level) {
+    where.push("level = ?");
+    args.push(opts.level);
+  }
+  if (opts.olderThanSec && opts.olderThanSec > 0) {
+    where.push("ts < ?");
+    args.push(Math.floor(Date.now() / 1000) - opts.olderThanSec);
+  }
+  const sql = `DELETE FROM app_logs ${where.length ? "WHERE " + where.join(" AND ") : ""}`;
+  const info = db.prepare(sql).run(...args);
+  return info.changes;
+}
+
+/* ============================================================
+ * COMPETITORS (Phase B)
+ *
+ * Tracks rival YouTube channels for the /ideate pipeline's live
+ * outlier-gather step. Synced via the YouTube Data API (1 unit per
+ * resolveChannel + 1 per playlistItems.list + batched videos.list).
+ * ============================================================ */
+
+// Fresh-install shape. Note: NO `UNIQUE` on channel_id — uniqueness is now
+// per (user_channel_id, channel_id) pair, enforced by a partial unique
+// index created AFTER the rebuild block runs (so existing installs have
+// the new column to index on). The previous global UNIQUE forbade
+// tracking the same competitor under two of the user's channels.
+//
+// Indexes referencing user_channel_id are intentionally NOT in this exec
+// block: on existing installs the CREATE TABLE IF NOT EXISTS is a no-op
+// against the legacy shape, so the index would fail with "no such column".
+// Indexes that don't reference user_channel_id stay here.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS competitors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id TEXT,                        -- UCxxxx; null until first sync resolves it
+    handle TEXT,                            -- @handle or full URL given by user
+    title TEXT,
+    avatar_url TEXT,
+    subscriber_count INTEGER,
+    video_count INTEGER,
+    added_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    last_sync_at INTEGER,
+    user_channel_id TEXT,                   -- one of the user's channels.id
+    tier TEXT NOT NULL DEFAULT 'authority', -- authority|breakthrough|adjacent|far
+    tier_set_at INTEGER,
+    thumbnail_policy TEXT NOT NULL DEFAULT 'allow',
+    thumbnail_policy_note TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_competitors_channel ON competitors(channel_id);
+
+  CREATE TABLE IF NOT EXISTS competitor_videos (
+    competitor_id INTEGER NOT NULL,
+    video_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    thumbnail_url TEXT,
+    views INTEGER DEFAULT 0,
+    likes INTEGER DEFAULT 0,
+    comments INTEGER DEFAULT 0,
+    duration_seconds INTEGER,
+    published_at INTEGER,
+    synced_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (competitor_id, video_id),
+    FOREIGN KEY (competitor_id) REFERENCES competitors(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_comp_videos_views ON competitor_videos(competitor_id, views DESC);
+
+  -- Per-user-channel hide list for outliers the user wants to suppress.
+  -- A single row hides one (user_channel, video) pair across every surface
+  -- that consumes outliers — Recent, Patterns extraction source, Topics
+  -- Gap source, /competitors/[id] outlier list, chat list_outliers. The
+  -- exclude is an overlay: the underlying competitor_video / competitor_alert
+  -- row is preserved, so a future Settings → Hidden outliers page can
+  -- restore by deleting the exclude row.
+  -- ON DELETE CASCADE through competitor_id cleans up if the user removes
+  -- a tracked competitor. reason is reserved for the future Restore UI.
+  CREATE TABLE IF NOT EXISTS competitor_video_excludes (
+    user_channel_id TEXT NOT NULL,
+    competitor_id   INTEGER NOT NULL,
+    video_id        TEXT NOT NULL,
+    excluded_at     INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    reason          TEXT,
+    PRIMARY KEY (user_channel_id, video_id),
+    FOREIGN KEY (competitor_id) REFERENCES competitors(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_cv_excludes_lookup
+    ON competitor_video_excludes(user_channel_id, video_id);
+`);
+
+// One-shot rebuild for existing installs whose `competitors` table still
+// carries the legacy `UNIQUE` on channel_id (which blocks tracking the
+// same competitor under two of the user's channels). Idempotent via the
+// `competitors.rebuiltForUserChannelScoping` settings flag.
+//
+// Critical detail: `DROP TABLE competitors` with foreign_keys=ON performs
+// an implicit `DELETE FROM competitors` first, which cascade-deletes all
+// rows in competitor_videos. PRAGMA defer_foreign_keys only delays
+// constraint *checks*, NOT cascade *actions* — so we MUST flip
+// foreign_keys=OFF for the duration of the rebuild. PRAGMA foreign_keys is
+// a no-op inside a transaction, so it is set OUTSIDE.
+//
+// Pre-existing rows land with user_channel_id = NULL (intentional — the
+// /competitors page shows a migration banner so the user assigns each
+// one to the right channel manually) and tier = 'authority' (from the
+// CREATE TABLE default). tier_set_at stays NULL until they re-tag.
+{
+  const rebuiltFlag = getSetting("competitors.rebuiltForUserChannelScoping");
+  if (rebuiltFlag !== "1") {
+    const cols = (
+      db.prepare(`PRAGMA table_info(competitors)`).all() as { name: string }[]
+    ).map((c) => c.name);
+    const alreadyOnNewShape = cols.includes("user_channel_id");
+    if (alreadyOnNewShape) {
+      // Fresh install — CREATE TABLE IF NOT EXISTS already laid down the
+      // new shape, nothing to rebuild. Just mark the flag so we don't
+      // do this check on every boot.
+      setSetting("competitors.rebuiltForUserChannelScoping", "1");
+    } else {
+      // foreign_keys MUST be toggled outside the transaction.
+      db.pragma("foreign_keys = OFF");
+      try {
+        const rebuild = db.transaction(() => {
+          db.exec(`
+            CREATE TABLE competitors_new (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              channel_id TEXT,
+              handle TEXT,
+              title TEXT,
+              avatar_url TEXT,
+              subscriber_count INTEGER,
+              video_count INTEGER,
+              added_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+              last_sync_at INTEGER,
+              user_channel_id TEXT,
+              tier TEXT NOT NULL DEFAULT 'authority',
+              tier_set_at INTEGER,
+              thumbnail_policy TEXT NOT NULL DEFAULT 'allow',
+              thumbnail_policy_note TEXT
+            )
+          `);
+          db.exec(`
+            INSERT INTO competitors_new
+              (id, channel_id, handle, title, avatar_url,
+               subscriber_count, video_count, added_at, last_sync_at)
+            SELECT
+              id, channel_id, handle, title, avatar_url,
+              subscriber_count, video_count, added_at, last_sync_at
+            FROM competitors
+          `);
+          db.exec(`DROP TABLE competitors`);
+          db.exec(`ALTER TABLE competitors_new RENAME TO competitors`);
+          db.exec(`CREATE INDEX IF NOT EXISTS idx_competitors_channel ON competitors(channel_id)`);
+          db.exec(`CREATE INDEX IF NOT EXISTS idx_competitors_user_channel ON competitors(user_channel_id)`);
+          db.exec(`
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_competitors_user_yt_unique
+              ON competitors(user_channel_id, channel_id)
+              WHERE user_channel_id IS NOT NULL AND channel_id IS NOT NULL
+          `);
+        });
+        rebuild();
+        // foreign_key_check returns rows for any dangling FK refs — if
+        // this rebuild went sideways we want to know loudly.
+        const dangling = db.prepare(`PRAGMA foreign_key_check`).all() as unknown[];
+        if (dangling.length > 0) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            "[db] competitors rebuild left dangling FKs:",
+            dangling
+          );
+        }
+        setSetting("competitors.rebuiltForUserChannelScoping", "1");
+        // eslint-disable-next-line no-console
+        console.warn("[db] competitors table rebuilt for user-channel scoping");
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn("[db] competitors rebuild failed (will retry on next boot):", err);
+      } finally {
+        db.pragma("foreign_keys = ON");
+      }
+    }
+  }
+}
+
+// Indexes that reference the new `user_channel_id` column. These run
+// AFTER the rebuild so existing installs have the column to index. Both
+// are CREATE … IF NOT EXISTS so re-running on a fresh install is a no-op.
+try {
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_competitors_user_channel
+      ON competitors(user_channel_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_competitors_user_yt_unique
+      ON competitors(user_channel_id, channel_id)
+      WHERE user_channel_id IS NOT NULL AND channel_id IS NOT NULL;
+  `);
+} catch (err) {
+  // eslint-disable-next-line no-console
+  console.warn("[db] competitors user-channel indexes failed (ignored):", err);
+}
+
+// Async-sync columns: rows queued by POST /api/competitors are picked up
+// later by the worker route. DEFAULT 'synced' (not 'queued') is critical —
+// pre-existing rows must NOT flip into the queue on first boot of the new
+// schema, otherwise every add migration would re-sync the entire catalogue.
+// similarity_score is the AI-scored 0–100 niche/audience match from §1.
+{
+  const competitorsCols = (
+    db.prepare(`PRAGMA table_info(competitors)`).all() as { name: string }[]
+  ).map((c) => c.name);
+  const newColumns: { name: string; sql: string }[] = [
+    {
+      name: "sync_status",
+      sql: `ALTER TABLE competitors ADD COLUMN sync_status TEXT NOT NULL DEFAULT 'synced'`,
+    },
+    { name: "sync_error", sql: `ALTER TABLE competitors ADD COLUMN sync_error TEXT` },
+    {
+      name: "similarity_score",
+      sql: `ALTER TABLE competitors ADD COLUMN similarity_score INTEGER`,
+    },
+  ];
+  for (const col of newColumns) {
+    if (!competitorsCols.includes(col.name)) {
+      try {
+        db.exec(col.sql);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(`[db] adding competitors.${col.name} failed:`, err);
+      }
+    }
+  }
+  // Status partial index — speeds up the worker's "next queued row" scan.
+  try {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_competitors_sync_status
+        ON competitors(sync_status)
+        WHERE sync_status IN ('queued', 'syncing', 'failed');
+    `);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn("[db] competitors sync_status index failed:", err);
+  }
+}
+
+export type CompetitorSyncStatus = "queued" | "syncing" | "synced" | "failed";
+
+export type Competitor = {
+  id: number;
+  channel_id: string | null;
+  handle: string | null;
+  title: string | null;
+  avatar_url: string | null;
+  subscriber_count: number | null;
+  video_count: number | null;
+  added_at: number;
+  last_sync_at: number | null;
+  user_channel_id: string | null;
+  tier: CompetitorTier;
+  tier_set_at: number | null;
+  sync_status: CompetitorSyncStatus;
+  sync_error: string | null;
+  similarity_score: number | null;
+  note: string | null;
+  thumbnail_policy: "allow" | "cms_exclude";
+  thumbnail_policy_note: string | null;
+};
+
+export const COMPETITOR_TIERS = ["authority", "breakthrough", "adjacent", "far"] as const;
+export type CompetitorTier = (typeof COMPETITOR_TIERS)[number];
+
+export function isCompetitorTier(v: unknown): v is CompetitorTier {
+  return (
+    typeof v === "string" &&
+    (COMPETITOR_TIERS as readonly string[]).includes(v)
+  );
+}
+
+export type CompetitorVideo = {
+  competitor_id: number;
+  video_id: string;
+  title: string;
+  thumbnail_url: string | null;
+  views: number;
+  likes: number;
+  comments: number;
+  duration_seconds: number | null;
+  published_at: number | null;
+  synced_at: number;
+};
+
+/**
+ * List competitors. Pass a userChannelId to scope to that user channel,
+ * pass the literal "unassigned" sentinel to get only NULL-user_channel_id
+ * rows (the migration view), or omit entirely to get every row across
+ * channels (used by the page's migration banner to compute totals).
+ */
+export function listCompetitors(
+  userChannelId?: string | "unassigned"
+): Competitor[] {
+  if (userChannelId === "unassigned") {
+    return db
+      .prepare(
+        `SELECT * FROM competitors WHERE user_channel_id IS NULL ORDER BY added_at DESC`
+      )
+      .all() as Competitor[];
+  }
+  if (typeof userChannelId === "string" && userChannelId.length > 0) {
+    return db
+      .prepare(
+        `SELECT * FROM competitors WHERE user_channel_id = ? ORDER BY added_at DESC`
+      )
+      .all(userChannelId) as Competitor[];
+  }
+  return db
+    .prepare(`SELECT * FROM competitors ORDER BY added_at DESC`)
+    .all() as Competitor[];
+}
+
+export function getCompetitor(id: number): Competitor | undefined {
+  return db.prepare(`SELECT * FROM competitors WHERE id = ?`).get(id) as
+    | Competitor
+    | undefined;
+}
+
+/**
+ * Pair-scoped lookup. Returns the row owned by `userChannelId` that
+ * tracks competitor `channelId`. Used by POST /api/competitors to
+ * return 409 before inserting a duplicate. The legacy global lookup
+ * has been removed because the same competitor may now legitimately
+ * be tracked under multiple user channels.
+ */
+export function getCompetitorByUserChannelAndYouTubeId(
+  userChannelId: string,
+  channelId: string
+): Competitor | undefined {
+  return db
+    .prepare(
+      `SELECT * FROM competitors WHERE user_channel_id = ? AND channel_id = ?`
+    )
+    .get(userChannelId, channelId) as Competitor | undefined;
+}
+
+/**
+ * Pre-sync dedup by handle within a user channel. The first sync
+ * resolves the real UC-id; without this check, the post-sync UPDATE
+ * would race against the partial unique index.
+ */
+export function getCompetitorByUserChannelAndHandle(
+  userChannelId: string,
+  handle: string
+): Competitor | undefined {
+  return db
+    .prepare(
+      `SELECT * FROM competitors WHERE user_channel_id = ? AND handle = ? COLLATE NOCASE`
+    )
+    .get(userChannelId, handle) as Competitor | undefined;
+}
+
+export function countUnassignedCompetitors(): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM competitors WHERE user_channel_id IS NULL`
+    )
+    .get() as { n: number };
+  return row.n;
+}
+
+export function addCompetitor(input: {
+  handle?: string | null;
+  channel_id?: string | null;
+  title?: string | null;
+  user_channel_id: string;
+  tier: CompetitorTier;
+}): number {
+  // sync_status='queued' so the worker picks the row up on its next pass.
+  // The schema's DEFAULT is 'synced' (so existing rows don't flip) — but
+  // for fresh inserts we always want them queued, so we set explicitly.
+  const info = db
+    .prepare(
+      `INSERT INTO competitors
+         (handle, channel_id, title, user_channel_id, tier, tier_set_at, sync_status)
+       VALUES (?, ?, ?, ?, ?, strftime('%s','now'), 'queued')`
+    )
+    .run(
+      input.handle ?? null,
+      input.channel_id ?? null,
+      input.title ?? null,
+      input.user_channel_id,
+      input.tier
+    );
+  return Number(info.lastInsertRowid);
+}
+
+/**
+ * Atomically transition the oldest queued competitor to 'syncing' and
+ * return it. Used by POST /api/competitors/sync-queued. Returns null
+ * when the queue is empty.
+ *
+ * The UPDATE … WHERE id = (SELECT MIN(id) …) form is atomic under WAL
+ * mode; better-sqlite3 also serialises writes per process so two parallel
+ * worker invocations can't both claim the same row.
+ */
+export function claimNextQueuedCompetitor(): Competitor | null {
+  const row = db
+    .prepare(
+      `UPDATE competitors
+       SET sync_status = 'syncing', sync_error = NULL
+       WHERE id = (
+         SELECT id FROM competitors
+         WHERE sync_status = 'queued'
+         ORDER BY added_at ASC, id ASC
+         LIMIT 1
+       )
+       RETURNING *`
+    )
+    .get() as Competitor | undefined;
+  return row ?? null;
+}
+
+export function markCompetitorSyncFailed(id: number, error: string): void {
+  db.prepare(
+    `UPDATE competitors SET sync_status = 'failed', sync_error = ? WHERE id = ?`
+  ).run(error.slice(0, 500), id);
+}
+
+export function markCompetitorSyncDone(id: number): void {
+  db.prepare(
+    `UPDATE competitors SET sync_status = 'synced', sync_error = NULL WHERE id = ?`
+  ).run(id);
+}
+
+/**
+ * Re-queue a single competitor (Retry button on a failed card, or "Sync
+ * now" on a synced one). The worker picks it up on the next /sync-queued
+ * tick.
+ */
+export function requeueCompetitor(id: number): void {
+  db.prepare(
+    `UPDATE competitors SET sync_status = 'queued', sync_error = NULL WHERE id = ?`
+  ).run(id);
+}
+
+export function setCompetitorSimilarityScore(id: number, score: number): void {
+  db.prepare(
+    `UPDATE competitors SET similarity_score = ? WHERE id = ?`
+  ).run(Math.max(0, Math.min(100, Math.round(score))), id);
+}
+
+/**
+ * T2 insert path: the new /competitors UI resolves the channel via YT
+ * Data API at POST time (no background sync), so we land a fully
+ * populated row with sync_status='synced'. Tier defaults to 'authority'
+ * via the column DEFAULT — the new UI doesn't surface tiers.
+ */
+export function addCompetitorResolved(input: {
+  user_channel_id: string;
+  channel_id: string;
+  handle: string | null;
+  title: string;
+  avatar_url: string | null;
+  subscriber_count: number | null;
+  note: string | null;
+}): number {
+  const info = db
+    .prepare(
+      `INSERT INTO competitors
+         (handle, channel_id, title, avatar_url, subscriber_count,
+          user_channel_id, note, tier, tier_set_at, sync_status, last_sync_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'authority', strftime('%s','now'),
+               'synced', strftime('%s','now'))`
+    )
+    .run(
+      input.handle,
+      input.channel_id,
+      input.title,
+      input.avatar_url,
+      input.subscriber_count,
+      input.user_channel_id,
+      input.note
+    );
+  return Number(info.lastInsertRowid);
+}
+
+export function setCompetitorNote(id: number, note: string | null): void {
+  const trimmed = note?.trim() ?? null;
+  db.prepare(`UPDATE competitors SET note = ? WHERE id = ?`).run(
+    trimmed && trimmed.length > 0 ? trimmed : null,
+    id
+  );
+}
+
+export function setCompetitorThumbnailPolicy(
+  id: number,
+  input: {
+    thumbnail_policy: "allow" | "cms_exclude";
+    thumbnail_policy_note?: string | null;
+  }
+): void {
+  const note = input.thumbnail_policy_note?.trim() ?? null;
+  db.prepare(
+    `UPDATE competitors
+     SET thumbnail_policy = ?,
+         thumbnail_policy_note = ?
+     WHERE id = ?`
+  ).run(
+    input.thumbnail_policy,
+    note && note.length > 0 ? note : null,
+    id
+  );
+}
+
+/**
+ * Counts of (queued + syncing) for the active scope. The client polls
+ * /api/competitors and stops polling when this is 0.
+ */
+export function countCompetitorsInFlight(userChannelId: string | null): number {
+  const sql =
+    userChannelId === null
+      ? `SELECT COUNT(*) AS n FROM competitors WHERE sync_status IN ('queued','syncing')`
+      : `SELECT COUNT(*) AS n FROM competitors
+         WHERE sync_status IN ('queued','syncing') AND user_channel_id = ?`;
+  const stmt = db.prepare(sql);
+  const row = (userChannelId === null
+    ? stmt.get()
+    : stmt.get(userChannelId)) as { n: number };
+  return row.n;
+}
+
+/**
+ * Patch the per-competitor user/tier assignment. Used by the migration
+ * banner ("assign to channel X") and the inline tier dropdown on each
+ * competitor card. tier_set_at gets bumped whenever tier changes.
+ */
+export function updateCompetitorAssignment(
+  id: number,
+  patch: { user_channel_id?: string | null; tier?: CompetitorTier }
+): Competitor | null {
+  const sets: string[] = [];
+  const args: (string | number | null)[] = [];
+  if ("user_channel_id" in patch) {
+    sets.push(`user_channel_id = ?`);
+    args.push(patch.user_channel_id ?? null);
+  }
+  if (patch.tier !== undefined) {
+    sets.push(`tier = ?`);
+    args.push(patch.tier);
+    sets.push(`tier_set_at = strftime('%s','now')`);
+  }
+  if (sets.length === 0) return getCompetitor(id) ?? null;
+  args.push(id);
+  db.prepare(`UPDATE competitors SET ${sets.join(", ")} WHERE id = ?`).run(
+    ...args
+  );
+  return getCompetitor(id) ?? null;
+}
+
+export function updateCompetitorAfterSync(
+  id: number,
+  patch: Partial<Competitor>
+): void {
+  const keys = Object.keys(patch) as (keyof Competitor)[];
+  if (keys.length === 0) return;
+  const setClause = keys.map((k) => `${k} = ?`).join(", ");
+  const values = keys.map((k) => patch[k] as unknown);
+  db.prepare(
+    `UPDATE competitors SET ${setClause}, last_sync_at = strftime('%s','now') WHERE id = ?`
+  ).run(...values, id);
+}
+
+export function deleteCompetitor(id: number): void {
+  // ON DELETE CASCADE cleans up competitor_videos.
+  db.prepare(`DELETE FROM competitors WHERE id = ?`).run(id);
+}
+
+export function upsertCompetitorVideo(v: {
+  competitor_id: number;
+  video_id: string;
+  title: string;
+  thumbnail_url?: string | null;
+  views?: number;
+  likes?: number;
+  comments?: number;
+  duration_seconds?: number | null;
+  published_at?: number | null;
+}): void {
+  db.prepare(
+    `INSERT INTO competitor_videos
+       (competitor_id, video_id, title, thumbnail_url, views, likes, comments, duration_seconds, published_at, synced_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
+     ON CONFLICT(competitor_id, video_id) DO UPDATE SET
+       title = excluded.title,
+       thumbnail_url = excluded.thumbnail_url,
+       views = excluded.views,
+       likes = excluded.likes,
+       comments = excluded.comments,
+       duration_seconds = excluded.duration_seconds,
+       published_at = excluded.published_at,
+       synced_at = excluded.synced_at`
+  ).run(
+    v.competitor_id,
+    v.video_id,
+    v.title,
+    v.thumbnail_url ?? null,
+    v.views ?? 0,
+    v.likes ?? 0,
+    v.comments ?? 0,
+    v.duration_seconds ?? null,
+    v.published_at ?? null
+  );
+}
+
+export function listCompetitorVideos(
+  competitorId: number,
+  limit = 100
+): CompetitorVideo[] {
+  return db
+    .prepare(
+      `SELECT * FROM competitor_videos
+       WHERE competitor_id = ?
+       ORDER BY views DESC
+       LIMIT ?`
+    )
+    .all(competitorId, limit) as CompetitorVideo[];
+}
+
+/**
+ * Per-competitor metrics computed for the card UI:
+ *  - `outliers60d`     count of videos where views > 2 × the channel's own
+ *                      60-day median (per MENTOR_METHOD §2). 0 when the
+ *                      window has fewer than 5 videos (sample too small).
+ *  - `medianViews60d`  the 60-day median itself (null when <5 videos).
+ *  - `lastUploadAt`    MAX(published_at) across all videos for this
+ *                      competitor (null when no videos).
+ *  - `recentVideoViews` last 10 videos' views, most-recent first.
+ *  - `totalViews`      SUM(views) across every synced video for this
+ *                      competitor. Honest replacement for the old 7d/28d/
+ *                      90d toggle, which over-promised time-windowed
+ *                      growth we can't actually compute without per-video
+ *                      view snapshots over time.
+ *  - `totalVideos`     COUNT(*) across every synced video. Rendered as a
+ *                      muted subtitle "across N videos" below totalViews.
+ *
+ * All values come from ONE SQL round trip — no N+1.
+ */
+export type CompetitorMetrics = {
+  outliers60d: number;
+  medianViews60d: number | null;
+  lastUploadAt: number | null;
+  recentVideoViews: number[];
+  totalViews: number;
+  totalVideos: number;
+};
+
+export function competitorMetricsByCompetitor(
+  userChannelId?: string | null
+): Map<number, CompetitorMetrics> {
+  const scope = userChannelId ?? null;
+  const rows = db
+    .prepare(
+      `WITH videos_60d AS (
+         SELECT v.competitor_id, v.views,
+                ROW_NUMBER() OVER (PARTITION BY v.competitor_id ORDER BY v.views) AS rn,
+                COUNT(*)     OVER (PARTITION BY v.competitor_id)                  AS n_60d
+         FROM competitor_videos v
+         JOIN competitors c ON c.id = v.competitor_id
+         WHERE v.published_at > strftime('%s','now') - 60 * 86400
+           AND (? IS NULL OR c.user_channel_id = ?)
+       ),
+       qualified_medians AS (
+         SELECT competitor_id, AVG(views) AS median_views
+         FROM videos_60d
+         WHERE n_60d >= 5 AND rn IN ((n_60d + 1) / 2, (n_60d + 2) / 2)
+         GROUP BY competitor_id
+       ),
+       outlier_60d_count AS (
+         SELECT v.competitor_id, COUNT(*) AS n_outliers
+         FROM competitor_videos v
+         JOIN qualified_medians m ON m.competitor_id = v.competitor_id
+         WHERE v.published_at > strftime('%s','now') - 60 * 86400
+           AND v.views > 2 * m.median_views
+         GROUP BY v.competitor_id
+       ),
+       last_upload_by_competitor AS (
+         SELECT competitor_id, MAX(published_at) AS last_upload_at
+         FROM competitor_videos
+         GROUP BY competitor_id
+       ),
+       recent_videos AS (
+         SELECT competitor_id, views,
+                ROW_NUMBER() OVER (PARTITION BY competitor_id ORDER BY published_at DESC) AS rn
+         FROM competitor_videos
+       ),
+       recent_views_by_competitor AS (
+         SELECT competitor_id, JSON_GROUP_ARRAY(views) AS recent_views_json
+         FROM recent_videos WHERE rn <= 10
+         GROUP BY competitor_id
+       ),
+       views_total AS (
+         SELECT v.competitor_id,
+                SUM(v.views) AS total_views,
+                COUNT(*)     AS total_videos
+         FROM competitor_videos v
+         GROUP BY v.competitor_id
+       )
+       SELECT
+         c.id                                  AS competitor_id,
+         COALESCE(o.n_outliers, 0)             AS outliers60d,
+         CAST(m.median_views AS INTEGER)       AS medianViews60d,
+         l.last_upload_at                      AS lastUploadAt,
+         COALESCE(r.recent_views_json, '[]')   AS recentVideoViewsJson,
+         COALESCE(w.total_views, 0)            AS totalViews,
+         COALESCE(w.total_videos, 0)           AS totalVideos
+       FROM competitors c
+       LEFT JOIN qualified_medians         m ON m.competitor_id = c.id
+       LEFT JOIN outlier_60d_count         o ON o.competitor_id = c.id
+       LEFT JOIN last_upload_by_competitor l ON l.competitor_id = c.id
+       LEFT JOIN recent_views_by_competitor r ON r.competitor_id = c.id
+       LEFT JOIN views_total               w ON w.competitor_id = c.id
+       WHERE (? IS NULL OR c.user_channel_id = ?)`
+    )
+    .all(scope, scope, scope, scope) as {
+    competitor_id: number;
+    outliers60d: number;
+    medianViews60d: number | null;
+    lastUploadAt: number | null;
+    recentVideoViewsJson: string;
+    totalViews: number;
+    totalVideos: number;
+  }[];
+
+  const map = new Map<number, CompetitorMetrics>();
+  for (const row of rows) {
+    let recent: number[] = [];
+    try {
+      const parsed = JSON.parse(row.recentVideoViewsJson);
+      if (Array.isArray(parsed)) recent = parsed.filter((n) => typeof n === "number");
+    } catch {
+      /* keep [] */
+    }
+    map.set(row.competitor_id, {
+      outliers60d: row.outliers60d,
+      medianViews60d: row.medianViews60d,
+      lastUploadAt: row.lastUploadAt,
+      recentVideoViews: recent,
+      totalViews: row.totalViews,
+      totalVideos: row.totalVideos,
+    });
+  }
+  return map;
+}
+
+/** Same shape as competitorMetricsByCompetitor but scoped to one competitor. */
+export function competitorMetricsForOne(
+  competitorId: number
+): CompetitorMetrics {
+  const row = db
+    .prepare(
+      `WITH videos_60d AS (
+         SELECT v.views,
+                ROW_NUMBER() OVER (ORDER BY v.views) AS rn,
+                COUNT(*)     OVER ()                 AS n_60d
+         FROM competitor_videos v
+         WHERE v.competitor_id = ?
+           AND v.published_at > strftime('%s','now') - 60 * 86400
+       ),
+       qualified_median AS (
+         SELECT AVG(views) AS median_views
+         FROM videos_60d
+         WHERE n_60d >= 5 AND rn IN ((n_60d + 1) / 2, (n_60d + 2) / 2)
+       ),
+       outliers_count AS (
+         SELECT COUNT(*) AS n_outliers
+         FROM competitor_videos v
+         CROSS JOIN qualified_median m
+         WHERE v.competitor_id = ?
+           AND v.published_at > strftime('%s','now') - 60 * 86400
+           AND v.views > 2 * m.median_views
+       ),
+       recent_views AS (
+         SELECT JSON_GROUP_ARRAY(views) AS recent_views_json
+         FROM (
+           SELECT views FROM competitor_videos
+           WHERE competitor_id = ?
+           ORDER BY published_at DESC
+           LIMIT 10
+         )
+       ),
+       last_upload AS (
+         SELECT MAX(published_at) AS last_upload_at
+         FROM competitor_videos WHERE competitor_id = ?
+       ),
+       views_total AS (
+         SELECT SUM(views) AS total_views, COUNT(*) AS total_videos
+         FROM competitor_videos WHERE competitor_id = ?
+       )
+       SELECT
+         COALESCE((SELECT n_outliers FROM outliers_count), 0)                AS outliers60d,
+         (SELECT CAST(median_views AS INTEGER) FROM qualified_median)        AS medianViews60d,
+         (SELECT last_upload_at FROM last_upload)                            AS lastUploadAt,
+         COALESCE((SELECT recent_views_json FROM recent_views), '[]')        AS recentVideoViewsJson,
+         COALESCE((SELECT total_views  FROM views_total), 0)                 AS totalViews,
+         COALESCE((SELECT total_videos FROM views_total), 0)                 AS totalVideos`
+    )
+    .get(
+      competitorId,
+      competitorId,
+      competitorId,
+      competitorId,
+      competitorId
+    ) as
+    | {
+        outliers60d: number;
+        medianViews60d: number | null;
+        lastUploadAt: number | null;
+        recentVideoViewsJson: string;
+        totalViews: number;
+        totalVideos: number;
+      }
+    | undefined;
+  if (!row) {
+    return {
+      outliers60d: 0,
+      medianViews60d: null,
+      lastUploadAt: null,
+      recentVideoViews: [],
+      totalViews: 0,
+      totalVideos: 0,
+    };
+  }
+  let recent: number[] = [];
+  try {
+    const parsed = JSON.parse(row.recentVideoViewsJson);
+    if (Array.isArray(parsed)) recent = parsed.filter((n) => typeof n === "number");
+  } catch {
+    /* keep [] */
+  }
+  return {
+    outliers60d: row.outliers60d,
+    medianViews60d: row.medianViews60d,
+    lastUploadAt: row.lastUploadAt,
+    recentVideoViews: recent,
+    totalViews: row.totalViews,
+    totalVideos: row.totalVideos,
+  };
+}
+
+/**
+ * Aggregate KPI strip values for /competitors. competitors = count of rows
+ * in scope; combinedSubs = SUM of subscriber_count; lastSync = MAX(last_sync_at).
+ * The strip itself only renders Competitors + Last sync — combinedSubs is
+ * kept in the wire shape for future use.
+ */
+export type CompetitorListKpis = {
+  competitors: number;
+  combinedSubs: number;
+  lastSync: number | null;
+};
+
+export function competitorListKpis(
+  userChannelId?: string | null
+): CompetitorListKpis {
+  const scope = userChannelId ?? null;
+  return db
+    .prepare(
+      `SELECT COUNT(*)                            AS competitors,
+              COALESCE(SUM(subscriber_count), 0)  AS combinedSubs,
+              MAX(last_sync_at)                   AS lastSync
+       FROM competitors
+       WHERE (? IS NULL OR user_channel_id = ?)`
+    )
+    .get(scope, scope) as CompetitorListKpis;
+}
+
+/**
+ * Median views across this competitor's catalogue. Used as the
+ * baseline for outlier detection — anything ≥2× median flips into
+ * an alert. Median chosen over mean because a single huge hit
+ * would otherwise hide all subsequent viral candidates.
+ */
+export function competitorMedianViews(competitorId: number): number {
+  const row = db
+    .prepare(
+      `WITH ordered AS (
+         SELECT views, ROW_NUMBER() OVER (ORDER BY views) AS rn,
+                COUNT(*) OVER () AS cnt
+         FROM competitor_videos
+         WHERE competitor_id = ?
+       )
+       SELECT AVG(views) AS median
+       FROM ordered
+       WHERE rn IN ((cnt + 1) / 2, (cnt + 2) / 2)`
+    )
+    .get(competitorId) as { median: number | null } | undefined;
+  return Math.round(row?.median ?? 0);
+}
+
+/**
+ * Hide a single competitor video from every outlier surface for the
+ * given user_channel. Idempotent — re-hiding the same pair is a no-op
+ * apart from refreshing excluded_at + reason. The competitor_alert /
+ * competitor_video rows themselves are preserved, so a future Settings
+ * → Hidden outliers page can restore by deleting the exclude row.
+ */
+export function hideCompetitorOutlier(opts: {
+  userChannelId: string;
+  competitorId: number;
+  videoId: string;
+  reason?: string | null;
+}): void {
+  db.prepare(
+    `INSERT INTO competitor_video_excludes
+       (user_channel_id, competitor_id, video_id, reason)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_channel_id, video_id) DO UPDATE SET
+       excluded_at = strftime('%s','now'),
+       reason      = excluded.reason`
+  ).run(
+    opts.userChannelId,
+    opts.competitorId,
+    opts.videoId,
+    opts.reason ?? null
+  );
+}
+
+/**
+ * Wipe every Topics Gap cache row for the given user_channel across
+ * all windows (the cache key is `competitor_topics_gap.cache.<uc>.<wN>`).
+ * Called after a hide so the next Generate click rebuilds without the
+ * hidden video in the source set.
+ */
+export function invalidateTopicsGapCache(userChannelId: string): void {
+  db.prepare(
+    `DELETE FROM settings WHERE key LIKE ? ESCAPE '\\'`
+  ).run(`competitor_topics_gap.cache.${userChannelId}.%`);
+}
+
+/**
+ * Gap analysis — words frequent in TOP videos of competitors but NOT
+ * in any of the user's own video titles. Returns the most "missed"
+ * keywords by aggregate competitor views. Stopwords skipped.
+ *
+ * Pure SQL-side aggregation; the tokeniser is lo-fi (split on
+ * non-word chars + lowercase) but it's enough to surface the
+ * obvious gaps the dashboard wants to show. Refinement (n-grams,
+ * lemmatisation) can come later if needed.
+ */
+const STOPWORDS = new Set([
+  "the","a","an","and","or","but","if","of","in","on","for","to","with","is","are","was","were","be","been",
+  "this","that","these","those","i","you","he","she","it","we","they","my","your","his","her","its","our","their",
+  "do","does","did","done","have","has","had","not","no","yes","at","by","from","as","than","then","so","very",
+  "what","when","where","why","how","who","which","there","here","just","like","get","got","make","made",
+  "will","would","can","could","should","shall","may","might","one","two","three","new",
+]);
+
+function tokeniseTitle(title: string): string[] {
+  return title
+    .toLowerCase()
+    .replace(/[^a-zа-яёіїєґ0-9 ]+/giu, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 4 && !STOPWORDS.has(w));
+}
+
+export function competitorGapAnalysis(
+  opts: { topN?: number; userChannelId?: string | null } = {}
+): Array<{
+  word: string;
+  competitorUses: number;
+  competitorTotalViews: number;
+  avgViews: number;
+  exampleCompetitorTitle: string;
+}> {
+  const top = opts.topN ?? 25;
+  // "Own" titles AND competitor pool must both be scoped to the user
+  // channel the analysis is for, otherwise gap words leak across channels.
+  const scopeChannelId = opts.userChannelId ?? getActiveChannelId();
+  const ownTitles = scopeChannelId
+    ? (db
+        .prepare(`SELECT title FROM videos WHERE channel_id = ?`)
+        .all(scopeChannelId) as { title: string }[])
+    : [];
+  const ownWords = new Set<string>();
+  for (const r of ownTitles) {
+    for (const w of tokeniseTitle(r.title)) ownWords.add(w);
+  }
+
+  // Pull each competitor video's title + views — but only from competitors
+  // belonging to this user channel. Aggregate frequency and total views
+  // per word; subtract words already in the user's catalogue at the end.
+  const compVideos = scopeChannelId
+    ? (db
+        .prepare(
+          `SELECT cv.title, cv.views
+             FROM competitor_videos cv
+             JOIN competitors c ON c.id = cv.competitor_id
+            WHERE c.user_channel_id = ?
+            ORDER BY cv.views DESC
+            LIMIT 1000`
+        )
+        .all(scopeChannelId) as { title: string; views: number }[])
+    : ([] as { title: string; views: number }[]);
+
+  type Agg = { uses: number; totalViews: number; sampleTitle: string };
+  const stats = new Map<string, Agg>();
+  for (const v of compVideos) {
+    const words = new Set(tokeniseTitle(v.title));
+    for (const w of words) {
+      if (ownWords.has(w)) continue;
+      const cur = stats.get(w);
+      if (cur) {
+        cur.uses += 1;
+        cur.totalViews += v.views;
+      } else {
+        stats.set(w, { uses: 1, totalViews: v.views, sampleTitle: v.title });
+      }
+    }
+  }
+  return Array.from(stats.entries())
+    .map(([word, s]) => ({
+      word,
+      competitorUses: s.uses,
+      competitorTotalViews: s.totalViews,
+      avgViews: Math.round(s.totalViews / Math.max(1, s.uses)),
+      exampleCompetitorTitle: s.sampleTitle,
+    }))
+    .filter((r) => r.competitorUses >= 2) // need at least 2 sightings to be a "pattern"
+    .sort((a, b) => b.competitorTotalViews - a.competitorTotalViews)
+    .slice(0, top);
+}
+
+/* ============================================================
+ * AI COMMENT ANALYSIS (Phase D)
+ *
+ * One Claude-driven breakdown per video, cached so repeat clicks
+ * don't re-bill. Captures audience sentiment, recurring themes,
+ * credibility objections, future-video ideas, and the best hook
+ * candidates lifted straight out of the comment stream.
+ * ============================================================ */
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS comment_analysis (
+    video_id TEXT PRIMARY KEY,
+    sentiment_score INTEGER NOT NULL,    -- 1-10 (1 = hostile, 10 = adoring)
+    themes TEXT,                          -- JSON array of strings
+    objections TEXT,                      -- JSON array of { text, severity }
+    future_ideas TEXT,                    -- JSON array of { title, demand, evidence }
+    hook_candidates TEXT,                 -- JSON array of { author, quote, why }
+    summary TEXT,                         -- one-paragraph synthesis
+    analyzed_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    analyzer_model TEXT,
+    comments_count INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE
+  );
+`);
+
+export type CommentAnalysis = {
+  video_id: string;
+  sentiment_score: number;
+  themes: string | null;
+  objections: string | null;
+  future_ideas: string | null;
+  hook_candidates: string | null;
+  summary: string | null;
+  analyzed_at: number;
+  analyzer_model: string | null;
+  comments_count: number;
+};
+
+export function getCommentAnalysis(videoId: string): CommentAnalysis | undefined {
+  return db
+    .prepare(`SELECT * FROM comment_analysis WHERE video_id = ?`)
+    .get(videoId) as CommentAnalysis | undefined;
+}
+
+export function upsertCommentAnalysis(a: CommentAnalysis): void {
+  db.prepare(
+    `INSERT INTO comment_analysis
+       (video_id, sentiment_score, themes, objections, future_ideas, hook_candidates,
+        summary, analyzed_at, analyzer_model, comments_count)
+     VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%s','now'), ?, ?)
+     ON CONFLICT(video_id) DO UPDATE SET
+       sentiment_score = excluded.sentiment_score,
+       themes = excluded.themes,
+       objections = excluded.objections,
+       future_ideas = excluded.future_ideas,
+       hook_candidates = excluded.hook_candidates,
+       summary = excluded.summary,
+       analyzed_at = strftime('%s','now'),
+       analyzer_model = excluded.analyzer_model,
+       comments_count = excluded.comments_count`
+  ).run(
+    a.video_id,
+    a.sentiment_score,
+    a.themes,
+    a.objections,
+    a.future_ideas,
+    a.hook_candidates,
+    a.summary,
+    a.analyzer_model,
+    a.comments_count
+  );
+}
+
+
+/* ============================================================
+ * Ideation pipeline tables (T5 — /ideate one-button)
+ *
+ * generations         — one row per Generate click (request_id PK)
+ * ideas               — per-idea rows linked to generation_id
+ * ideation_rules      — channel-scoped rules (free-form banned topics +
+ *                       LLM-distilled rules with pending=1 awaiting Apply)
+ * gather_attrition_log — competitors dropped from a gather() pass when
+ *                       the YT API call ceiling would otherwise be exceeded
+ *
+ * Channel-level additions:
+ *   channels.banned_topics  — comma-separated topic ban list (free-form)
+ *   competitors.note        — per-competitor free-form note shown on card
+ * ============================================================ */
+
+// ALTER channels: add banned_topics + last_user_videos_sync_at. Idempotent
+// via PRAGMA guard. last_user_videos_sync_at stores an ISO-8601 string
+// (or NULL when never synced) — used by /api/sync/user-videos to gate
+// fresh YT pulls at 15-minute granularity per channel.
+try {
+  const cols = db
+    .prepare(`PRAGMA table_info(channels)`)
+    .all() as { name: string }[];
+  if (!cols.some((c) => c.name === "banned_topics")) {
+    db.exec(`ALTER TABLE channels ADD COLUMN banned_topics TEXT`);
+  }
+  if (!cols.some((c) => c.name === "last_user_videos_sync_at")) {
+    db.exec(`ALTER TABLE channels ADD COLUMN last_user_videos_sync_at TEXT`);
+  }
+  if (!cols.some((c) => c.name === "avatar_url")) {
+    db.exec(`ALTER TABLE channels ADD COLUMN avatar_url TEXT`);
+  }
+  if (!cols.some((c) => c.name === "topic_analysis_json")) {
+    db.exec(`ALTER TABLE channels ADD COLUMN topic_analysis_json TEXT`);
+  }
+  if (!cols.some((c) => c.name === "topic_analysis_at")) {
+    db.exec(`ALTER TABLE channels ADD COLUMN topic_analysis_at TEXT`);
+  }
+  if (!cols.some((c) => c.name === "reddit_sources")) {
+    db.exec(`ALTER TABLE channels ADD COLUMN reddit_sources TEXT`);
+  }
+  if (!cols.some((c) => c.name === "thumbnail_style_goals")) {
+    db.exec(`ALTER TABLE channels ADD COLUMN thumbnail_style_goals TEXT`);
+  }
+  if (!cols.some((c) => c.name === "thumbnail_design_rules")) {
+    db.exec(`ALTER TABLE channels ADD COLUMN thumbnail_design_rules TEXT`);
+  }
+} catch {
+  /* noop */
+}
+
+// ALTER competitors: add note. Idempotent. T2 surfaces this as an
+// inline textarea on each card. NULL = no note yet.
+try {
+  const cols = db
+    .prepare(`PRAGMA table_info(competitors)`)
+    .all() as { name: string }[];
+  if (!cols.some((c) => c.name === "note")) {
+    db.exec(`ALTER TABLE competitors ADD COLUMN note TEXT`);
+  }
+  if (!cols.some((c) => c.name === "thumbnail_policy")) {
+    db.exec(`ALTER TABLE competitors ADD COLUMN thumbnail_policy TEXT NOT NULL DEFAULT 'allow'`);
+  }
+  if (!cols.some((c) => c.name === "thumbnail_policy_note")) {
+    db.exec(`ALTER TABLE competitors ADD COLUMN thumbnail_policy_note TEXT`);
+  }
+} catch {
+  /* noop */
+}
+
+// ALTER ideas: PRIO-9 used_by_user + used_at; PRIO-10 feedback +
+// feedback_reason + feedback_at. The CREATE TABLE below carries these
+// for fresh installs; this guard backfills existing rows.
+// Note: SQLite ALTER TABLE doesn't support CHECK constraints on added
+// columns — we enforce 'positive'|'negative' in the route handler. The
+// CREATE TABLE below DOES have the CHECK (applies on fresh schema).
+try {
+  const cols = db
+    .prepare(`PRAGMA table_info(ideas)`)
+    .all() as { name: string }[];
+  if (!cols.some((c) => c.name === "used_by_user")) {
+    db.exec(`ALTER TABLE ideas ADD COLUMN used_by_user INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!cols.some((c) => c.name === "used_at")) {
+    db.exec(`ALTER TABLE ideas ADD COLUMN used_at TEXT`);
+  }
+  if (!cols.some((c) => c.name === "feedback")) {
+    db.exec(`ALTER TABLE ideas ADD COLUMN feedback TEXT`);
+  }
+  if (!cols.some((c) => c.name === "feedback_reason")) {
+    db.exec(`ALTER TABLE ideas ADD COLUMN feedback_reason TEXT`);
+  }
+  if (!cols.some((c) => c.name === "feedback_at")) {
+    db.exec(`ALTER TABLE ideas ADD COLUMN feedback_at TEXT`);
+  }
+  if (!cols.some((c) => c.name === "proof_json")) {
+    db.exec(`ALTER TABLE ideas ADD COLUMN proof_json TEXT`);
+  }
+  if (!cols.some((c) => c.name === "confidence_level")) {
+    db.exec(`ALTER TABLE ideas ADD COLUMN confidence_level TEXT`);
+  }
+  if (!cols.some((c) => c.name === "research_sources_json")) {
+    db.exec(`ALTER TABLE ideas ADD COLUMN research_sources_json TEXT`);
+  }
+  if (!cols.some((c) => c.name === "fit_reason")) {
+    db.exec(`ALTER TABLE ideas ADD COLUMN fit_reason TEXT`);
+  }
+} catch {
+  /* noop */
+}
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS generations (
+    id TEXT PRIMARY KEY,
+    user_channel_id TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK (mode IN ('auto','new_angles','title_tweaks','reddit_angles')),
+    count INTEGER NOT NULL CHECK (count >= 10 AND count <= 25),
+    status TEXT NOT NULL CHECK (status IN ('processing','completed','failed')) DEFAULT 'processing',
+    estimated_cost_millicents INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT,
+    error TEXT,
+    FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_generations_channel_started
+    ON generations(user_channel_id, started_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_generations_status
+    ON generations(status, started_at DESC);
+
+  CREATE TABLE IF NOT EXISTS ideas (
+    id TEXT PRIMARY KEY,
+    generation_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    source_attribution TEXT,
+    validation_status TEXT NOT NULL CHECK (validation_status IN ('passed','rejected')),
+    validation_reason TEXT,
+    fit_score INTEGER,
+    fit_reason TEXT,
+    user_note TEXT,
+    note_distilled_at TEXT,
+    used_by_user INTEGER NOT NULL DEFAULT 0,
+    used_at TEXT,
+    feedback TEXT CHECK (feedback IS NULL OR feedback IN ('positive','negative')),
+    feedback_reason TEXT,
+    feedback_at TEXT,
+    proof_json TEXT,
+    confidence_level TEXT CHECK (confidence_level IS NULL OR confidence_level IN ('high','medium','low')),
+    research_sources_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (generation_id) REFERENCES generations(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_ideas_generation ON ideas(generation_id);
+  CREATE INDEX IF NOT EXISTS idx_ideas_note_pending
+    ON ideas(generation_id, note_distilled_at)
+    WHERE user_note IS NOT NULL AND note_distilled_at IS NULL;
+
+  CREATE TABLE IF NOT EXISTS ideation_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_channel_id TEXT NOT NULL,
+    rule_type TEXT NOT NULL CHECK (rule_type IN ('banned_topic','banned_substitution','banned_pattern','preferred_format','preferred_topic')),
+    rule_value TEXT NOT NULL,
+    source_note TEXT,
+    source_idea_id TEXT,
+    pending INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_ideation_rules_channel
+    ON ideation_rules(user_channel_id, pending, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS gather_attrition_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    generation_id TEXT NOT NULL,
+    dropped_competitor_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (generation_id) REFERENCES generations(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_gather_attrition_generation
+    ON gather_attrition_log(generation_id);
+
+  CREATE TABLE IF NOT EXISTS reddit_research_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_channel_id TEXT NOT NULL,
+    topic_key TEXT NOT NULL,
+    subreddit TEXT NOT NULL,
+    reddit_id TEXT,
+    title TEXT NOT NULL,
+    permalink TEXT NOT NULL,
+    score INTEGER NOT NULL DEFAULT 0,
+    comments INTEGER NOT NULL DEFAULT 0,
+    created_utc INTEGER,
+    observed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    summary TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL UNIQUE,
+    source_json TEXT,
+    FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_reddit_research_channel_topic
+    ON reddit_research_items(user_channel_id, topic_key, observed_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_reddit_research_subreddit
+    ON reddit_research_items(subreddit, observed_at DESC);
+
+  CREATE TABLE IF NOT EXISTS generation_research_items (
+    generation_id TEXT NOT NULL,
+    research_item_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (generation_id, research_item_id),
+    FOREIGN KEY (generation_id) REFERENCES generations(id) ON DELETE CASCADE,
+    FOREIGN KEY (research_item_id) REFERENCES reddit_research_items(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_generation_research_generation
+    ON generation_research_items(generation_id);
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS thumbnail_runs (
+    id TEXT PRIMARY KEY,
+    user_channel_id TEXT NOT NULL,
+    source_idea_id TEXT,
+    input_title TEXT NOT NULL,
+    channel_url TEXT,
+    status TEXT NOT NULL CHECK (status IN ('processing','completed','failed')) DEFAULT 'processing',
+    selected_references_json TEXT NOT NULL DEFAULT '[]',
+    channel_snapshot_json TEXT,
+    style_goals TEXT,
+    learned_rules_json TEXT,
+    error TEXT,
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT,
+    FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_idea_id) REFERENCES ideas(id) ON DELETE SET NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_thumbnail_runs_channel_started
+    ON thumbnail_runs(user_channel_id, started_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_thumbnail_runs_status
+    ON thumbnail_runs(status, started_at DESC);
+
+  CREATE TABLE IF NOT EXISTS thumbnail_candidates (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    rank INTEGER NOT NULL CHECK (rank >= 1 AND rank <= 3),
+    status TEXT NOT NULL CHECK (status IN ('processing','completed','failed')) DEFAULT 'processing',
+    job_id TEXT,
+    model TEXT,
+    image_path TEXT,
+    source_thumbnails_json TEXT NOT NULL DEFAULT '[]',
+    prompt TEXT,
+    rationale TEXT,
+    feedback TEXT CHECK (feedback IS NULL OR feedback IN ('accepted','rejected')),
+    feedback_reason TEXT,
+    feedback_at TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT,
+    FOREIGN KEY (run_id) REFERENCES thumbnail_runs(id) ON DELETE CASCADE,
+    UNIQUE(run_id, rank)
+  );
+  CREATE INDEX IF NOT EXISTS idx_thumbnail_candidates_run
+    ON thumbnail_candidates(run_id, rank);
+  CREATE INDEX IF NOT EXISTS idx_thumbnail_candidates_job
+    ON thumbnail_candidates(job_id);
+
+  CREATE TABLE IF NOT EXISTS thumbnail_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_channel_id TEXT NOT NULL,
+    rule_type TEXT NOT NULL CHECK (rule_type IN ('accepted_pattern','rejected_pattern')),
+    rule_value TEXT NOT NULL,
+    source_candidate_id TEXT,
+    source_feedback TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_candidate_id) REFERENCES thumbnail_candidates(id) ON DELETE SET NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_thumbnail_rules_channel
+    ON thumbnail_rules(user_channel_id, created_at DESC);
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS image_runs (
+    id TEXT PRIMARY KEY,
+    user_channel_id TEXT NOT NULL,
+    source_idea_id TEXT,
+    mode TEXT NOT NULL CHECK (mode IN ('prompt','assist','ideate')) DEFAULT 'prompt',
+    generation_mode TEXT NOT NULL CHECK (generation_mode IN ('generate','remix')) DEFAULT 'generate',
+    input_prompt TEXT NOT NULL,
+    title TEXT,
+    sample_count INTEGER NOT NULL CHECK (sample_count >= 1 AND sample_count <= 4) DEFAULT 1,
+    aspect_ratio TEXT NOT NULL DEFAULT '16:9',
+    resolution TEXT NOT NULL DEFAULT '2k',
+    ai_assist INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL CHECK (status IN ('processing','completed','failed')) DEFAULT 'processing',
+    phase TEXT NOT NULL CHECK (phase IN ('planning','rendering','reviewing','completed','failed')) DEFAULT 'planning',
+    error_category TEXT CHECK (error_category IS NULL OR error_category IN ('planner_timeout','planner_failed','provider_capacity','provider_rejected','provider_timeout','download_failed','provider_failed','unknown')),
+    selected_references_json TEXT NOT NULL DEFAULT '[]',
+    attachments_json TEXT NOT NULL DEFAULT '[]',
+    channel_snapshot_json TEXT,
+    learned_rules_json TEXT NOT NULL DEFAULT '[]',
+    error TEXT,
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT,
+    FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_idea_id) REFERENCES ideas(id) ON DELETE SET NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_image_runs_channel_started
+    ON image_runs(user_channel_id, started_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_image_runs_status
+    ON image_runs(status, started_at DESC);
+
+  CREATE TABLE IF NOT EXISTS image_candidates (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    rank INTEGER NOT NULL CHECK (rank >= 1 AND rank <= 4),
+    status TEXT NOT NULL CHECK (status IN ('processing','completed','failed')) DEFAULT 'processing',
+    job_id TEXT,
+    model TEXT,
+    resolution TEXT,
+    image_path TEXT,
+    source_images_json TEXT NOT NULL DEFAULT '[]',
+    provider_attempts_json TEXT NOT NULL DEFAULT '[]',
+    prompt TEXT,
+    rationale TEXT,
+    changes TEXT,
+    critique TEXT,
+    feedback TEXT CHECK (feedback IS NULL OR feedback IN ('accepted','rejected')),
+    feedback_reason TEXT,
+    feedback_at TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT,
+    FOREIGN KEY (run_id) REFERENCES image_runs(id) ON DELETE CASCADE,
+    UNIQUE(run_id, rank)
+  );
+  CREATE INDEX IF NOT EXISTS idx_image_candidates_run
+    ON image_candidates(run_id, rank);
+  CREATE INDEX IF NOT EXISTS idx_image_candidates_job
+    ON image_candidates(job_id);
+
+  CREATE TABLE IF NOT EXISTS image_feedback_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_channel_id TEXT NOT NULL,
+    rule_type TEXT NOT NULL CHECK (rule_type IN ('accepted_pattern','rejected_pattern')),
+    rule_value TEXT NOT NULL,
+    source_candidate_id TEXT,
+    source_feedback TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_candidate_id) REFERENCES image_candidates(id) ON DELETE SET NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_image_feedback_rules_channel
+    ON image_feedback_rules(user_channel_id, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS image_feedback_rule_suggestions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_channel_id TEXT NOT NULL,
+    source_candidate_id TEXT NOT NULL,
+    feedback TEXT NOT NULL CHECK (feedback IN ('accepted','rejected')),
+    user_note TEXT NOT NULL,
+    suggested_rule TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'google',
+    model TEXT NOT NULL DEFAULT 'gemini-flash-latest',
+    status TEXT NOT NULL CHECK (status IN ('pending','applied','rejected')) DEFAULT 'pending',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    resolved_at TEXT,
+    FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_candidate_id) REFERENCES image_candidates(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_image_feedback_rule_suggestions_channel
+    ON image_feedback_rule_suggestions(user_channel_id, status, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_image_feedback_rule_suggestions_candidate
+    ON image_feedback_rule_suggestions(source_candidate_id, status);
+
+  CREATE TABLE IF NOT EXISTS image_planner_style_profiles (
+    user_channel_id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    source_window_days INTEGER NOT NULL DEFAULT 30,
+    source_video_ids_json TEXT NOT NULL DEFAULT '[]',
+    profile_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS image_source_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_channel_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    source_video_id TEXT,
+    source_url TEXT NOT NULL,
+    source_title TEXT,
+    source_channel_name TEXT,
+    source_channel_handle TEXT,
+    feedback TEXT NOT NULL CHECK (feedback IN ('liked','disliked')),
+    reason TEXT,
+    topic_key TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+    UNIQUE(user_channel_id, source_url)
+  );
+  CREATE INDEX IF NOT EXISTS idx_image_source_feedback_channel
+    ON image_source_feedback(user_channel_id, updated_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_image_source_feedback_video
+    ON image_source_feedback(user_channel_id, source_video_id);
+`);
+
+try {
+  const imageRunCols = db
+    .prepare(`PRAGMA table_info(image_runs)`)
+    .all() as { name: string }[];
+  if (!imageRunCols.some((c) => c.name === "resolution")) {
+    db.exec(`ALTER TABLE image_runs ADD COLUMN resolution TEXT NOT NULL DEFAULT '2k'`);
+  }
+  if (!imageRunCols.some((c) => c.name === "phase")) {
+    db.exec(`ALTER TABLE image_runs ADD COLUMN phase TEXT NOT NULL DEFAULT 'planning'`);
+    db.exec(`
+      UPDATE image_runs
+      SET phase = CASE
+        WHEN status = 'completed' THEN 'reviewing'
+        WHEN status = 'failed' THEN 'failed'
+        ELSE 'planning'
+      END
+    `);
+  }
+  if (!imageRunCols.some((c) => c.name === "error_category")) {
+    db.exec(`ALTER TABLE image_runs ADD COLUMN error_category TEXT`);
+  }
+  const imageCandidateCols = db
+    .prepare(`PRAGMA table_info(image_candidates)`)
+    .all() as { name: string }[];
+  if (!imageCandidateCols.some((c) => c.name === "resolution")) {
+    db.exec(`ALTER TABLE image_candidates ADD COLUMN resolution TEXT`);
+  }
+  if (!imageCandidateCols.some((c) => c.name === "provider_attempts_json")) {
+    db.exec(`ALTER TABLE image_candidates ADD COLUMN provider_attempts_json TEXT NOT NULL DEFAULT '[]'`);
+  }
+  if (!imageCandidateCols.some((c) => c.name === "drive_file_id")) {
+    db.exec(`ALTER TABLE image_candidates ADD COLUMN drive_file_id TEXT`);
+  }
+  if (!imageCandidateCols.some((c) => c.name === "drive_url")) {
+    db.exec(`ALTER TABLE image_candidates ADD COLUMN drive_url TEXT`);
+  }
+} catch {
+  /* noop */
+}
+
+try {
+  const row = db
+    .prepare(
+      `SELECT sql FROM sqlite_master WHERE type='table' AND name='generations'`
+    )
+    .get() as { sql: string } | undefined;
+  if (row?.sql && !row.sql.includes("'reddit_angles'")) {
+    db.pragma("foreign_keys = OFF");
+    db.exec(`
+      CREATE TABLE generations_rebuild (
+        id TEXT PRIMARY KEY,
+        user_channel_id TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK (mode IN ('auto','new_angles','title_tweaks','reddit_angles')),
+        count INTEGER NOT NULL CHECK (count >= 10 AND count <= 25),
+        status TEXT NOT NULL CHECK (status IN ('processing','completed','failed')) DEFAULT 'processing',
+        estimated_cost_millicents INTEGER NOT NULL DEFAULT 0,
+        started_at TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at TEXT,
+        error TEXT,
+        FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE
+      );
+      INSERT INTO generations_rebuild
+        (id, user_channel_id, mode, count, status, estimated_cost_millicents, started_at, completed_at, error)
+      SELECT id, user_channel_id, mode, count, status, estimated_cost_millicents, started_at, completed_at, error
+      FROM generations;
+      DROP TABLE generations;
+      ALTER TABLE generations_rebuild RENAME TO generations;
+      CREATE INDEX IF NOT EXISTS idx_generations_channel_started
+        ON generations(user_channel_id, started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_generations_status
+        ON generations(status, started_at DESC);
+    `);
+    db.pragma("foreign_keys = ON");
+  }
+} catch {
+  try {
+    db.pragma("foreign_keys = ON");
+  } catch {
+    /* noop */
+  }
+  /* noop */
+}
