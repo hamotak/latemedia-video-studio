@@ -6,7 +6,7 @@ Copy this prompt into Claude Code on Bilal's Windows computer.
 You are helping me set up a local video generation app on Windows. I am new to coding, so please guide me step by step and keep everything simple.
 
 GitHub repo:
-<paste the GitHub repo link here>
+https://github.com/hamotak/bilal-video-studio
 
 Goal:
 - Download/install the app on this Windows computer.
