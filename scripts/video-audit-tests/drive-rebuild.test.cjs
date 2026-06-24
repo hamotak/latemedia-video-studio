@@ -15,7 +15,7 @@ const {
 } = require("../../src/lib/video-engine/services/scene-assets-disk.ts");
 
 function makeRunDir() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "late-media-drive-rebuild-"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bilal-drive-rebuild-"));
   fs.writeFileSync(
     path.join(dir, "scenes.json"),
     JSON.stringify(
@@ -92,7 +92,7 @@ console.log("  ok");
 
 console.log("Test 4 - mismatched raw clips trigger the empty-manifest guard condition:");
 {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "late-media-empty-manifest-"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bilal-empty-manifest-"));
   try {
     fs.writeFileSync(
       path.join(dir, "scenes.json"),

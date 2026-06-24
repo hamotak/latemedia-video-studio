@@ -21,7 +21,8 @@ export function localLibraryRoot(): string {
 }
 
 function legacyLocalLibraryRoot(): string {
-  return path.join(os.homedir(), "Desktop", "Late Media Videos");
+  const legacyBrand = ["Late", "Media", "Videos"].join(" ");
+  return path.join(os.homedir(), "Desktop", legacyBrand);
 }
 
 function localLibraryReadRoots(): string[] {

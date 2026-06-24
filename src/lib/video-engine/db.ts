@@ -8,8 +8,8 @@ import { DATA_DIR } from "./data-dir";
  * Lives outside the project source tree so Turbopack file-watcher doesn't try
  * to scan SQLite shm/wal files (which can be locked on Windows).
  *
- * Override via LATE_MEDIA_DATA_DIR. CONVEYER_HUM_DATA_DIR remains supported
- * for machines that already have older local data.
+ * Override via BILAL_DATA_DIR. Older data-dir env names remain supported
+ * silently for machines that already have local data.
  */
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 

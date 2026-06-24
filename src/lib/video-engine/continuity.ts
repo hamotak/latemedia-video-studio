@@ -1,7 +1,7 @@
 /**
  * Visual-continuity planning — pure rules, no DB, no FFmpeg.
  *
- * Late Media Editing Tool generates each scene independently, so adjacent shots can jump
+ * Bilal Video Studio generates each scene independently, so adjacent shots can jump
  * even when the narration is one beat. Continuity gives the next scene a way
  * to inherit visual identity (subject, wardrobe, palette) from the previous
  * one when they actually belong together — and to deliberately NOT inherit

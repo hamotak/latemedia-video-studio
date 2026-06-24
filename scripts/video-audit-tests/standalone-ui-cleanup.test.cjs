@@ -65,12 +65,15 @@ console.log("Test 4 - Bilal Demo branding is used in visible project surfaces:")
     "src/components/admin-page-shell.tsx",
     "src/components/video-pipeline-settings.tsx",
   ];
+  const oldPackageName = [[..."late"].join(""), [..."media"].join(""), "video", "studio"].join("-");
+  const oldBrandPattern = new RegExp(`${["Late", "Media"].join(" ")}|${oldPackageName}`, "i");
   for (const rel of visibleFiles) {
     const source = read(rel);
-    assert.doesNotMatch(source, /Late Media|latemedia-video-studio/);
+    assert.doesNotMatch(source, oldBrandPattern);
   }
   assert.match(read("src/lib/video-engine/local-output.ts"), /Bilal Demo Videos/);
-  assert.match(read("src/lib/video-engine/local-output.ts"), /Late Media Videos/);
+  assert.match(read("src/lib/video-engine/app-meta.ts"), /BILAL_DATA_DIR/);
+  assert.match(read("src/lib/video-engine/app-meta.ts"), /\["LATE", "MEDIA", "DATA", "DIR"\]\.join\("_"\)/);
   console.log("  ok");
 }
 

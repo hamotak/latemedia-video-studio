@@ -27,7 +27,7 @@ import { channelBRollsDir, listBRollClipRows, resolveBRollClipPath } from "../lo
  * Stock / B-roll library for the standalone app.
  *
  * The canonical clips live as plain local files under
- * ~/Desktop/Late Media Videos/<Channel>/B-Rolls. Legacy Drive helpers remain
+ * ~/Desktop/Bilal Demo Videos/<Channel>/B-Rolls. Legacy Drive helpers remain
  * below for old migration endpoints, but the active video pipeline reads the
  * local B-roll folder first and does not require Drive.
  */
@@ -140,7 +140,7 @@ export function resolveLocalStockClipPath(id: string): string {
   return full;
 }
 
-/** Resolve the legacy Drive folder id for Late Media Editing Tool / Clips Library / <folder>. */
+/** Resolve the legacy Drive folder id for the old editing tool's Clips Library / <folder>. */
 async function resolveFolderId(folder: string): Promise<string> {
   const root = await findOrCreateFolder(DRIVE_ROOT_FOLDER);
   const lib = await findOrCreateFolder("Clips Library", root);

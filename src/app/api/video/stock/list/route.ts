@@ -14,7 +14,7 @@ function stockJson(body: unknown, init?: ResponseInit) {
 
 /**
  * GET /api/video/stock/list — the active channel's B-roll clips from the local
- * library (~/Desktop/Late Media Videos/<Channel>/B-Rolls). No Google Drive.
+ * library (~/Desktop/Bilal Demo Videos/<Channel>/B-Rolls). No Google Drive.
  */
 export async function GET(req: Request) {
   const parsedChannelId = parseOptionalChannelId(new URL(req.url).searchParams.get("channelId"));

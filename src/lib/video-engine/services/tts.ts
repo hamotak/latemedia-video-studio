@@ -184,7 +184,7 @@ function resolveVoiceId(voiceOverride: string | null | undefined, fallback: stri
 }
 
 /**
- * 69labs MiniMax TTS — the primary voiceover engine for Late Media Editing Tool.
+ * 69labs MiniMax TTS — the primary voiceover engine for Bilal Video Studio.
  *
  * The user picks a MiniMax catalog voice (e.g. "English_Comedian") or a cloned
  * voice in the 69labs dashboard → MiniMax, then pastes that voice id into

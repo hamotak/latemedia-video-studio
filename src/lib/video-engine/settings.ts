@@ -112,8 +112,8 @@ export const SETTING_KEYS = [
   "GDRIVE_REFRESH_TOKEN",
   // Email of the Google account that authorized — set automatically, shown in UI.
   "GDRIVE_CONNECTED_EMAIL",
-  // Folder IDs in Drive. Empty = auto-create `Late Media Editing Tool/Final Videos` and
-  // `Late Media Editing Tool/Clips Library` in the user's Drive root on first sync.
+  // Folder IDs in Drive. Kept only for legacy compatibility; the standalone
+  // app stores generated files locally.
   "GDRIVE_ROOT_FOLDER_ID",
   "GDRIVE_CHANNELS_FOLDER_ID",
   "GDRIVE_FINAL_VIDEOS_FOLDER_ID",
@@ -205,7 +205,7 @@ export const DEFAULTS: Record<SettingKey, string> = {
   SCENE_SPLIT_MODEL: "gemini-flash-latest",
   IMAGE_CUT_VISUAL_MODEL: "gemini-2.5-pro",
 
-  // TTS — Late Media Editing Tool defaults to ElevenLabs voices through the
+  // TTS — Bilal Video Studio defaults to ElevenLabs voices through the
   // 69labs gateway (TTS_PROVIDER=69labs + TTS_VOICE_PROVIDER=elevenlabs).
   STYLE_PRESET_ID: "sleep-calm",          // no-channel run's style preset (Prompt 9)
   TTS_PROVIDER: "69labs",
@@ -234,7 +234,7 @@ export const DEFAULTS: Record<SettingKey, string> = {
   IMAGE_RATIO: "16:9",
   IMAGE_RESOLUTION: "1k",
 
-  // Animations — Late Media Editing Tool animates EVERY scene through 69labs.
+  // Animations — Bilal Video Studio animates every generated scene through 69labs.
   ANIMATION_PROVIDER: "69labs",
   ANIMATION_MODEL: "veo-3.1-fast",        // Faster Veo path via 69labs (image-to-video); grok-imagine-video is the legacy option
   ANIMATION_RATIO_PERCENT: "100",         // 100 % of scenes animated, no Ken-Burns mix
@@ -315,7 +315,7 @@ export function seedDefaults() {
 /**
  * One-time correction for users coming from the legacy video app template: force
  * video generation on and animate 100% of scenes on first boot. The video MODEL
- * is left alone — Late Media Editing Tool defaults to Veo 3.1 Fast (`veo-3.1-fast`) and Grok
+ * is left alone — Bilal Video Studio defaults to Veo 3.1 Fast (`veo-3.1-fast`) and Grok
  * stays a switchable option.
  * Tracked via a flag so we never overwrite a user's later manual choice.
  */
@@ -340,7 +340,7 @@ function forceVideoOnlyMode() {
 }
 
 /**
- * 2026-05-28: restore the image-keyframed pipeline. Older Late Media Editing Tool rows
+ * 2026-05-28: restore the image-keyframed pipeline. Older legacy rows
  * intentionally set IMAGE_PROVIDER=off for text-to-video; switch only that
  * legacy/off value back to 69labs, preserving any explicit alternative.
  */

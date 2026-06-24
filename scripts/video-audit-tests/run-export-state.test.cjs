@@ -7,8 +7,8 @@ const path = require("node:path");
 
 require("./register-ts.cjs");
 
-const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "late-media-export-state-"));
-process.env.LATE_MEDIA_DATA_DIR = dataDir;
+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "bilal-export-state-"));
+process.env.BILAL_DATA_DIR = dataDir;
 
 const { readRunExportState } = require("../../src/lib/video-engine/run-export-state.ts");
 
