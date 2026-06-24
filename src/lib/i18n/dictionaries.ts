@@ -344,7 +344,7 @@ type DictionaryShape = {
 export const dictionaries: { en: DictionaryShape } = {
   en: {
     app: {
-      name: "Late Media App",
+      name: "Bilal Demo",
     },
     nav: {
       dashboard: "Dashboard",

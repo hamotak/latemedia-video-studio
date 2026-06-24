@@ -8,8 +8,7 @@ import { createClient } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils";
 
 /**
- * Top-right channel switcher for the unified Studio (Supabase-backed,
- * per-user active channel).
+ * Top-right channel switcher for the unified Studio's local channel list.
  */
 export function StudioChannelSwitcher() {
   const { channels, activeChannel, activeChannelId, switchChannel, loading } = useActiveChannel();
@@ -75,7 +74,7 @@ export function StudioChannelSwitcher() {
       </button>
 
       {open && (
-        <div className="absolute right-0 top-full z-50 mt-2 w-80 overflow-hidden rounded-[7px] border border-border bg-card/95 shadow-lg backdrop-blur">
+        <div className="absolute right-0 top-full z-[80] mt-2 w-80 overflow-hidden rounded-[7px] border border-border bg-card/95 shadow-lg backdrop-blur">
           <div className="border-b border-border px-2.5 py-2 text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">
             Channels
           </div>
@@ -106,14 +105,8 @@ export function StudioChannelSwitcher() {
                   >
                     <ChannelAvatar channel={c} />
                     <div className="min-w-0 flex-1">
-                        <p className="truncate font-semibold">{c.name}</p>
-                      {c.handle && (
-                        <p className="truncate text-[11px] text-muted-foreground">{c.handle}</p>
-                      )}
+                      <p className="truncate font-semibold">{c.name}</p>
                     </div>
-                    <span className="shrink-0 rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-muted-foreground">
-                      {typeof c.subscriber_count === "number" ? formatCompact(c.subscriber_count) : "—"}
-                    </span>
                     {switchingId === c.id ? (
                       <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
                     ) : active ? (
@@ -145,11 +138,6 @@ export function StudioChannelSwitcher() {
       )}
     </div>
   );
-}
-
-function formatCompact(value: number | null | undefined) {
-  if (typeof value !== "number") return "";
-  return Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(value);
 }
 
 function ChannelAvatar({ channel }: { channel: { name: string; avatar_url: string | null } | null }) {

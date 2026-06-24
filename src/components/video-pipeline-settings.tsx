@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Check, FolderOpen, KeyRound, Loader2, Sliders } from "lucide-react";
+import { Check, FolderOpen, KeyRound, Loader2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -16,15 +16,9 @@ import { fetchJson } from "@/lib/client-fetch";
  * animation model — stays at the proven defaults from
  * `video-engine/settings.ts` and is intentionally not exposed.
  */
-const API_KEY_FIELDS: { key: string; label: string; hint?: string }[] = [
-  { key: "LABS69_API_KEY", label: "69labs API key", hint: "Required — video, voiceover & images." },
-  { key: "GOOGLE_API_KEY", label: "Google Gemini API key", hint: "Required — scene splitting & visual prompts." },
-];
-
-const ADVANCED_FIELDS: { key: string; label: string; hint?: string }[] = [
-  { key: "VIDEO_RESOLUTION", label: "Video resolution", hint: "e.g. 1920x1080" },
-  { key: "VIDEO_FPS", label: "Video FPS", hint: "24, 30 or 60" },
-  { key: "FFMPEG_PATH", label: "FFmpeg path", hint: "Leave blank — FFmpeg is bundled." },
+const API_KEY_FIELDS: { key: string; label: string }[] = [
+  { key: "LABS69_API_KEY", label: "69labs API key" },
+  { key: "GOOGLE_API_KEY", label: "Google Gemini API key" },
 ];
 
 export function VideoPipelineSettings() {
@@ -35,7 +29,6 @@ export function VideoPipelineSettings() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [showAdvanced, setShowAdvanced] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -86,7 +79,7 @@ export function VideoPipelineSettings() {
   // Non-admins (403) don't get this section at all.
   if (!allowed) return null;
 
-  const outputDir = masked.LOCAL_LIBRARY_DIR || "Desktop → Late Media Videos";
+  const outputDir = masked.LOCAL_LIBRARY_DIR || "Desktop → Bilal Demo Videos";
 
   return (
     <Card>
@@ -116,10 +109,6 @@ export function VideoPipelineSettings() {
             <div className="space-y-3">
               <div>
                 <h3 className="text-sm font-semibold">API keys</h3>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  Paste your keys below — they are stored only on this computer. A saved key shows as
-                  dots; type a new value to replace it.
-                </p>
               </div>
               <SettingsFieldGrid fields={API_KEY_FIELDS} masked={masked} edits={edits} onChange={setEdits} secret />
             </div>
@@ -130,22 +119,6 @@ export function VideoPipelineSettings() {
                 Finished videos and B-Rolls are saved locally to{" "}
                 <span className="font-medium text-foreground">{outputDir}</span>.
               </p>
-            </div>
-
-            <div className="rounded-lg border border-border bg-background/50">
-              <button
-                type="button"
-                onClick={() => setShowAdvanced((v) => !v)}
-                className="flex w-full items-center gap-2 px-4 py-3 text-left text-sm font-medium text-muted-foreground transition-colors hover:text-foreground"
-              >
-                <Sliders className="h-3.5 w-3.5" />
-                Advanced (optional)
-              </button>
-              {showAdvanced && (
-                <div className="border-t border-border p-4">
-                  <SettingsFieldGrid fields={ADVANCED_FIELDS} masked={masked} edits={edits} onChange={setEdits} />
-                </div>
-              )}
             </div>
 
             <div className="flex items-center justify-end gap-3 border-t border-border pt-4">
@@ -169,7 +142,7 @@ function SettingsFieldGrid({
   onChange,
   secret,
 }: {
-  fields: { key: string; label: string; hint?: string }[];
+  fields: { key: string; label: string }[];
   masked: Record<string, string>;
   edits: Record<string, string>;
   onChange: React.Dispatch<React.SetStateAction<Record<string, string>>>;
@@ -191,7 +164,6 @@ function SettingsFieldGrid({
               className="h-9 text-sm"
               autoComplete="off"
             />
-            {f.hint && <p className="text-[11px] text-muted-foreground">{f.hint}</p>}
           </div>
         );
       })}

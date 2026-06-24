@@ -5,8 +5,7 @@ import {
   AlertTriangle,
   Check,
   ChevronDown,
-  ExternalLink,
-  HardDrive,
+  FolderOpen,
   ImageIcon,
   Loader2,
   Lock,
@@ -16,7 +15,6 @@ import {
   Trash2,
   Tv2,
   UploadCloud,
-  Wrench,
 } from "lucide-react";
 import { useActiveChannel } from "@/lib/active-channel-context";
 import { PageContainer } from "@/components/ui/page-container";
@@ -48,7 +46,6 @@ interface StockListResponse {
   cacheFolder?: string | null;
   count: number;
   clips: StockClip[];
-  driveFolderLink?: string | null;
   message?: string | null;
   detail?: string | null;
   errorKind?: string | null;
@@ -95,19 +92,7 @@ interface StockGenJob {
   updatedAt?: number;
   finishedAt?: number;
   lastError?: string;
-  driveFolderLink?: string;
   clips?: StockGenClipStep[];
-}
-
-interface LegacyImportResponse {
-  dryRun?: boolean;
-  moved?: number;
-  skipped?: number;
-  trashedFolders?: number;
-  failed?: number;
-  errors?: string[];
-  error?: string;
-  targetFolder?: string;
 }
 
 type Notice = { tone: "info" | "warning"; text: string };
@@ -332,9 +317,9 @@ function jobPipelineText(job: StockGenJob | null) {
   const active = [
     activeImages ? `${activeImages} image${activeImages === 1 ? "" : "s"} rendering` : "",
     activeVideos ? `${activeVideos} video${activeVideos === 1 ? "" : "s"} animating` : "",
-    activeUploads ? `${activeUploads} upload${activeUploads === 1 ? "" : "s"}` : "",
+    activeUploads ? `${activeUploads} save${activeUploads === 1 ? "" : "s"}` : "",
   ].filter(Boolean);
-  return `${imagesDone}/${total} images / ${videosDone}/${total} videos / ${uploadsDone}/${total} uploaded${job.failed > 0 ? ` / ${job.failed} failed` : ""}${active.length ? ` / ${active.join(", ")}` : ""}`;
+  return `${imagesDone}/${total} images / ${videosDone}/${total} videos / ${uploadsDone}/${total} saved${job.failed > 0 ? ` / ${job.failed} failed` : ""}${active.length ? ` / ${active.join(", ")}` : ""}`;
 }
 
 export default function StudioVideoClipsPage() {
@@ -636,15 +621,11 @@ function StockGenerationPanel({
   onClipsChanged,
   onActiveBatchChange,
   onNotice,
-  onImportLegacy,
-  importingLegacy,
 }: {
   channelId: number;
   onClipsChanged: () => Promise<void>;
   onActiveBatchChange: (snapshot: ActiveBatchSnapshot) => void;
   onNotice: (notice: Notice) => void;
-  onImportLegacy: () => Promise<void>;
-  importingLegacy: boolean;
 }) {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [countText, setCountText] = useState(String(DEFAULT_BROLL_COUNT));
@@ -840,10 +821,6 @@ function StockGenerationPanel({
               {stopping ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-4 w-4" />}
               Stop
             </Button>
-            <Button type="button" variant="outline" onClick={onImportLegacy} disabled={loading || importingLegacy}>
-              {importingLegacy ? <Loader2 className="h-4 w-4 animate-spin" /> : <UploadCloud className="h-4 w-4" />}
-              Import old
-            </Button>
           </div>
         </div>
       </div>
@@ -888,7 +865,6 @@ function StockGenerationPanel({
 
 function BrollsView({ channelId, channelName }: { channelId: number; channelName: string }) {
   const [folder, setFolder] = useState<string | null>(null);
-  const [driveFolderLink, setDriveFolderLink] = useState<string | null>(null);
   const [clips, setClips] = useState<StockClip[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -896,8 +872,6 @@ function BrollsView({ channelId, channelName }: { channelId: number; channelName
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [deleting, setDeleting] = useState(false);
   const [deletingClipId, setDeletingClipId] = useState<string | null>(null);
-  const [repairing, setRepairing] = useState(false);
-  const [importingLegacy, setImportingLegacy] = useState(false);
   const [hoveredClipId, setHoveredClipId] = useState<string | null>(null);
   const [visibleCardLimit, setVisibleCardLimit] = useState(INITIAL_VISIBLE_CARD_LIMIT);
   const [activeBatch, setActiveBatch] = useState<ActiveBatchSnapshot>(emptyActiveBatch);
@@ -921,14 +895,13 @@ function BrollsView({ channelId, channelName }: { channelId: number; channelName
       if (!isCurrent()) return;
       setClips(Array.isArray(j.clips) ? j.clips : []);
       setFolder(j.folder ?? null);
-      setDriveFolderLink(typeof j.driveFolderLink === "string" ? j.driveFolderLink : null);
       setSelected(new Set());
       if (j.message) {
-        setNotice({ tone: j.errorKind === "drive_auth" ? "warning" : "info", text: j.message });
+        setNotice({ tone: "info", text: j.message });
       }
     } catch (e) {
       if (!isCurrent()) return;
-      setError(e instanceof Error ? e.message : "Could not load B-rolls. Check Drive or reconnect in settings.");
+      setError(e instanceof Error ? e.message : "Could not load the local B-roll folder.");
       setClips((prev) => prev ?? []);
     } finally {
       if (isCurrent()) setLoading(false);
@@ -1018,12 +991,12 @@ function BrollsView({ channelId, channelName }: { channelId: number; channelName
       });
       const j = (await r.json().catch(() => ({}))) as { error?: string; failed?: number; deleted?: number };
       if (!r.ok || j.failed) {
-        setNotice({ tone: "warning", text: String(j.error || "Could not delete selected B-rolls from Drive.") });
+        setNotice({ tone: "warning", text: String(j.error || "Could not delete selected B-rolls locally.") });
         return;
       }
       setSelected(new Set());
       setClips((prev) => (prev ? prev.filter((clip) => !ids.includes(clip.driveFileId)) : prev));
-      setNotice({ tone: "info", text: `${j.deleted ?? ids.length} B-roll${ids.length === 1 ? "" : "s"} moved to Google Drive trash.` });
+      setNotice({ tone: "info", text: `${j.deleted ?? ids.length} B-roll${ids.length === 1 ? "" : "s"} deleted locally.` });
       await load();
     } finally {
       setDeleting(false);
@@ -1034,83 +1007,13 @@ function BrollsView({ channelId, channelName }: { channelId: number; channelName
   async function deleteSelected() {
     const ids = selectedCards.map(cardDriveId).filter((id): id is string => Boolean(id));
     if (ids.length === 0) return;
-    if (!window.confirm(`Move ${ids.length} B-roll${ids.length === 1 ? "" : "s"} to Google Drive trash?`)) return;
+    if (!window.confirm(`Delete ${ids.length} B-roll${ids.length === 1 ? "" : "s"} from the local library?`)) return;
     await deleteIds(ids);
   }
 
   async function deleteSingle(id: string) {
     setDeletingClipId(id);
     await deleteIds([id]);
-  }
-
-  async function repairWorkspace() {
-    setRepairing(true);
-    setError(null);
-    try {
-      const params = new URLSearchParams({ channelId: String(channelId) });
-      const r = await fetch(`/api/video/drive/workspace/repair?${params.toString()}`, { method: "POST" });
-      const j = (await r.json().catch(() => ({}))) as {
-        error?: string;
-        repair?: {
-          repairedFolders?: unknown[];
-          skippedNonEmptyFolders?: unknown[];
-          legacyFallbackFolders?: unknown[];
-        };
-      };
-      if (!r.ok) {
-        setNotice({ tone: "warning", text: j.error || "Drive repair failed." });
-        return;
-      }
-      await load();
-      const repaired = j.repair?.repairedFolders?.length ?? 0;
-      const skipped = j.repair?.skippedNonEmptyFolders?.length ?? 0;
-      const legacy = j.repair?.legacyFallbackFolders?.length ?? 0;
-      setNotice({
-        tone: "info",
-        text: `Drive workspace checked. ${repaired} folder${repaired === 1 ? "" : "s"} repaired, ${skipped} non-empty skipped, ${legacy} legacy fallback${legacy === 1 ? "" : "s"} found.`,
-      });
-    } finally {
-      setRepairing(false);
-    }
-  }
-
-  async function importLegacyBrolls() {
-    setImportingLegacy(true);
-    setError(null);
-    try {
-      const dryRunRes = await fetch("/api/video/stock/import-legacy", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ channelId, dryRun: true }),
-      });
-      const dryRun = (await dryRunRes.json().catch(() => ({}))) as LegacyImportResponse;
-      if (!dryRunRes.ok) throw new Error(dryRun.error || "Could not inspect old B-roll folders.");
-      const moveCount = dryRun.moved ?? 0;
-      if (moveCount <= 0) {
-        setNotice({ tone: "info", text: "No old B-rolls need importing." });
-        return;
-      }
-      if (!window.confirm(`Move ${moveCount} old B-roll${moveCount === 1 ? "" : "s"} into the current channel folder?`)) {
-        setNotice({ tone: "info", text: "Old B-roll import cancelled." });
-        return;
-      }
-      const importRes = await fetch("/api/video/stock/import-legacy", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ channelId, dryRun: false }),
-      });
-      const result = (await importRes.json().catch(() => ({}))) as LegacyImportResponse;
-      if (!importRes.ok) throw new Error(result.error || "Could not import old B-rolls.");
-      await load();
-      setNotice({
-        tone: result.failed ? "warning" : "info",
-        text: `Old B-roll import finished. ${result.moved || 0} moved, ${result.skipped || 0} skipped, ${result.trashedFolders || 0} empty folder${result.trashedFolders === 1 ? "" : "s"} trashed${result.failed ? `, ${result.failed} failed` : ""}.`,
-      });
-    } catch (e) {
-      setNotice({ tone: "warning", text: e instanceof Error ? e.message : "Could not import old B-rolls." });
-    } finally {
-      setImportingLegacy(false);
-    }
   }
 
   const hasLoaded = clips !== null;
@@ -1122,21 +1025,9 @@ function BrollsView({ channelId, channelName }: { channelId: number; channelName
         onHistoryClick={() => setHistoryOpen(true)}
         actions={
           <div className="flex flex-wrap items-center justify-end gap-2">
-            {driveFolderLink && (
-              <a href={driveFolderLink} target="_blank" rel="noopener noreferrer">
-                <Button variant="outline" size="sm">
-                  <ExternalLink className="h-3.5 w-3.5" />
-                  Drive
-                </Button>
-              </a>
-            )}
             <Button variant="outline" size="sm" onClick={load} disabled={loading}>
               {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
               Refresh
-            </Button>
-            <Button variant="outline" size="sm" onClick={repairWorkspace} disabled={loading || repairing}>
-              {repairing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wrench className="h-3.5 w-3.5" />}
-              Repair
             </Button>
           </div>
         }
@@ -1147,8 +1038,6 @@ function BrollsView({ channelId, channelName }: { channelId: number; channelName
         onClipsChanged={load}
         onActiveBatchChange={setActiveBatch}
         onNotice={setNotice}
-        onImportLegacy={importLegacyBrolls}
-        importingLegacy={importingLegacy}
       />
 
       {notice && (
@@ -1173,7 +1062,7 @@ function BrollsView({ channelId, channelName }: { channelId: number; channelName
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="min-w-0">
             <p className="text-sm font-semibold">
-              {activeCount} Drive B-roll{activeCount === 1 ? "" : "s"}
+              {activeCount} local B-roll{activeCount === 1 ? "" : "s"}
             </p>
             <p className="text-xs text-muted-foreground">{selected.size} selected</p>
           </div>
@@ -1212,8 +1101,8 @@ function BrollsView({ channelId, channelName }: { channelId: number; channelName
         {loading && !hasLoaded && (
           <div className="rounded-lg border border-dashed border-border bg-muted/15 p-8 text-center">
             <Loader2 className="mx-auto mb-3 h-6 w-6 animate-spin text-primary" />
-            <p className="text-sm font-medium">Checking Drive B-rolls</p>
-            <p className="mt-1 text-xs text-muted-foreground">This can take a few seconds when Drive is waking up.</p>
+            <p className="text-sm font-medium">Checking local B-rolls</p>
+            <p className="mt-1 text-xs text-muted-foreground">Reading this channel's B-roll folder on this machine.</p>
           </div>
         )}
 
@@ -1226,9 +1115,9 @@ function BrollsView({ channelId, channelName }: { channelId: number; channelName
 
         {hasLoaded && unifiedCards.length === 0 && !error && (
           <div className="rounded-lg border border-dashed border-border p-8 text-center">
-            <HardDrive className="mx-auto mb-2 h-7 w-7 text-muted-foreground/40" />
+            <FolderOpen className="mx-auto mb-2 h-7 w-7 text-muted-foreground/40" />
             <p className="text-sm font-medium">No B-rolls yet</p>
-            <p className="mt-1 text-xs text-muted-foreground">Generate a batch or import old clips to fill this channel library.</p>
+            <p className="mt-1 text-xs text-muted-foreground">Generate a batch to fill this channel library.</p>
           </div>
         )}
 
@@ -1241,7 +1130,6 @@ function BrollsView({ channelId, channelName }: { channelId: number; channelName
               const label = card.kind === "generated"
                 ? card.clip.displayName || displayClipName(card.clip.index)
                 : cleanClipName(card.clip.displayName || card.clip.name) || card.clip.name;
-              const driveLink = card.clip.driveFileLink;
               const videoId = card.kind === "broll" ? card.clip.previewFileId || card.clip.driveFileId : card.clip.driveFileId;
               return (
                 <article
@@ -1290,25 +1178,13 @@ function BrollsView({ channelId, channelName }: { channelId: number; channelName
                     </button>
                   )}
                   <div className="pointer-events-none absolute inset-0 flex items-start justify-end gap-1 bg-gradient-to-b from-black/35 via-transparent to-transparent p-2 opacity-0 group-hover:opacity-100">
-                    {driveLink && (
-                      <a
-                        href={driveLink}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="pointer-events-auto grid h-7 w-7 place-items-center rounded-md bg-black/60 text-white backdrop-blur transition-colors hover:bg-black/75"
-                        title="Open in Drive"
-                        onClick={(event) => event.stopPropagation()}
-                      >
-                        <ExternalLink className="h-3.5 w-3.5" />
-                      </a>
-                    )}
                     {id && (
                       <Button
                         type="button"
                         variant="destructive"
                         size="sm"
                         className="pointer-events-auto h-7 w-7 p-0"
-                        title="Move to Google Drive trash"
+                        title="Delete local B-roll"
                         onClick={(event) => {
                           event.preventDefault();
                           event.stopPropagation();

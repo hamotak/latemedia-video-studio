@@ -30,14 +30,20 @@ require.extensions[".ts"] = (mod, filename) => {
 
 async function main() {
   const [, , action, runId, token] = process.argv;
+  const pipeline = require(path.join(
+    process.cwd(),
+    "src/lib/video-engine/pipeline.ts"
+  ));
+
+  if (action === "self-test") {
+    return;
+  }
+
   if ((action !== "run" && action !== "resume") || !runId || !token) {
     throw new Error("Usage: node scripts/video-worker.cjs <run|resume> <runId> <token>");
   }
 
-  const { runVideoWorkerProcess } = require(path.join(
-    process.cwd(),
-    "src/lib/video-engine/pipeline.ts"
-  ));
+  const { runVideoWorkerProcess } = pipeline;
   await runVideoWorkerProcess(action, runId, token);
 }
 

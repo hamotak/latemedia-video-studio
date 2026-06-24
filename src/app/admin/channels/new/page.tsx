@@ -19,7 +19,6 @@ export default function NewChannelPage() {
   const router = useRouter();
   const { switchChannel, refresh } = useActiveChannel();
   const [name, setName] = useState("");
-  const [handle, setHandle] = useState("");
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState("");
 
@@ -34,7 +33,7 @@ export default function NewChannelPage() {
       const res = await fetch("/api/studio/channels", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ name: name.trim(), handle: handle.trim() || null }),
+        body: JSON.stringify({ name: name.trim(), handle: null }),
       });
       const data = (await res.json().catch(() => ({}))) as {
         channel?: { id: number };
@@ -53,7 +52,6 @@ export default function NewChannelPage() {
   return (
     <AdminPageShell
       title="Add channel"
-      description="Create a channel to render videos against. You can fine-tune its voice and visual style later in Settings."
       backHref="/admin"
       backLabel="Dashboard"
       maxWidth="max-w-lg"
@@ -66,20 +64,11 @@ export default function NewChannelPage() {
             id="ch-name"
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder="e.g. Earth Radar"
+            placeholder="e.g. Bilal History"
             autoFocus
             onKeyDown={(e) => {
               if (e.key === "Enter") void create();
             }}
-          />
-        </div>
-        <div className="space-y-2">
-          <Label htmlFor="ch-handle">Handle (optional)</Label>
-          <Input
-            id="ch-handle"
-            value={handle}
-            onChange={(e) => setHandle(e.target.value)}
-            placeholder="@earthradar"
           />
         </div>
         <Button onClick={() => void create()} disabled={creating || !name.trim()} className="w-full">

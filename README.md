@@ -1,4 +1,4 @@
-# Late Media Video Studio
+# Bilal Demo Video Generation
 
 Turn a script into a finished, narrated video — **locally on your own PC**. No login, no accounts, no cloud database. You bring your own API keys, and everything runs and saves on your machine.
 
@@ -7,7 +7,7 @@ Turn a script into a finished, narrated video — **locally on your own PC**. No
 - **Channels** — create a channel that holds a voice + visual style.
 - **Video** — paste a script/title and generate a narrated video (scenes → images → motion → voiceover → final MP4).
 - **B-Rolls** — a reusable stock-clip library.
-- **Settings** — paste your API keys and tune voice, models, and render options.
+- **Settings** — paste your API keys.
 
 ## Requirements
 
@@ -21,8 +21,8 @@ Turn a script into a finished, narrated video — **locally on your own PC**. No
 ## Quick start (Windows)
 
 1. Install **Node.js 20+** from https://nodejs.org (LTS).
-2. Double-click **`install.bat`** — one time, installs dependencies (2–5 minutes).
-3. Double-click **`start.bat`** — the app opens at **http://localhost:2000**.
+2. Double-click **`install.bat`** — one time, installs dependencies (2-5 minutes).
+3. Double-click **`start.bat`** — the app opens at **http://localhost:3000**.
 4. Open **Settings** in the left sidebar and paste your **69labs** and **Google** keys. Then create a **Channel** and open **Video**.
 
 To stop the app, close the black terminal window.
@@ -31,7 +31,7 @@ To stop the app, close the black terminal window.
 
 ```bash
 npm install
-npm run dev      # serves http://localhost:2000
+npm run dev      # serves http://localhost:3000
 ```
 
 ## Where is my data?
@@ -42,6 +42,6 @@ Everything is stored locally in the **`data/`** folder inside this project — c
 
 You can ask Claude Code to run it for you:
 
-> "Launch this app on localhost:2000."
+> "Launch this app on localhost:3000."
 
 Claude will run `npm install` (if needed) and `npm run dev`. See [CLAUDE.md](CLAUDE.md) for details.

@@ -1,21 +1,12 @@
-"use client";
-
-import { useRouter } from "next/navigation";
-import { AdminPageShell } from "@/components/admin-page-shell";
-import { getSettingsReturn } from "@/lib/settings-return";
+import { PageContainer } from "@/components/ui/page-container";
 
 export default function AdminSettingsLayout({ children }: { children: React.ReactNode }) {
-  const router = useRouter();
-
   return (
-    <AdminPageShell
-      title="Settings"
-      description="Video pipeline settings and your API keys."
-      onBack={() => router.push(getSettingsReturn())}
-      backLabel="Back"
-      maxWidth="max-w-3xl"
-    >
+    <PageContainer className="max-w-3xl space-y-5">
+      <h1 className="text-[19px] font-semibold leading-tight tracking-normal text-foreground">
+        Settings
+      </h1>
       {children}
-    </AdminPageShell>
+    </PageContainer>
   );
 }

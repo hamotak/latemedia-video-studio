@@ -1124,7 +1124,6 @@ function muxAudioNoFades(
         "-ar", String(ASSEMBLY_AUDIO_SAMPLE_RATE),
         "-b:a 192k",
         "-movflags +faststart",
-        "-shortest",
       ])
       .on("error", reject)
       .on("end", () => resolve());
@@ -1391,7 +1390,6 @@ async function renderSceneAV(
       "-ar", String(ASSEMBLY_AUDIO_SAMPLE_RATE),
       "-b:a 192k",
       "-movflags +faststart",
-      "-shortest",
     ]);
   await saveRegisteredFfmpeg(
     runId,
@@ -1834,7 +1832,6 @@ export async function assembleTail(
       "-ar", String(ASSEMBLY_AUDIO_SAMPLE_RATE),
       "-b:a 192k",
       "-movflags +faststart",
-      "-shortest",
     ]);
   await saveRegisteredFfmpeg(runId, "tail audio mux", muxCmd, outPath);
   try { fs.unlinkSync(silentPath); } catch {}

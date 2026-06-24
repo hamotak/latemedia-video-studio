@@ -1,14 +1,17 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import Link from "next/link";
-import { usePathname } from "next/navigation";
-import { ChevronDown, Moon, Sun, Shield, UserRound, Settings } from "lucide-react";
+import { ChevronDown, Moon, Sun, Shield, UserRound } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { useTheme } from "@/lib/theme-provider";
-import { rememberSettingsReturn } from "@/lib/settings-return";
 import { cn } from "@/lib/utils";
-import type { User } from "@supabase/supabase-js";
+
+type LocalUser = {
+  id: string;
+  email?: string | null;
+  app_metadata?: Record<string, any> | null;
+  user_metadata?: Record<string, any> | null;
+};
 
 function initials(nickname: string | null, email: string) {
   const src = nickname?.trim() || email.split("@")[0];
@@ -20,8 +23,7 @@ function initials(nickname: string | null, email: string) {
 }
 
 export function UserButton() {
-  const pathname = usePathname();
-  const [user, setUser] = useState<User | null>(null);
+  const [user, setUser] = useState<LocalUser | null>(null);
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const { theme, toggle } = useTheme();
@@ -30,13 +32,13 @@ export function UserButton() {
     createClient().auth.getClaims().then(({ data }) =>
       setUser(
         data?.claims
-          ? ({
-              id: data.claims.sub,
-              email: data.claims.email,
-              app_metadata: data.claims.app_metadata,
-              user_metadata: data.claims.user_metadata,
-            } as unknown as User)
-          : null
+            ? ({
+                id: data.claims.sub,
+                email: data.claims.email,
+                app_metadata: data.claims.app_metadata,
+                user_metadata: data.claims.user_metadata,
+              } as LocalUser)
+            : null
       )
     );
   }, []);
@@ -57,7 +59,6 @@ export function UserButton() {
   const username = (user.user_metadata?.username as string)?.trim() || user.email?.split("@")[0] || "";
   const role: string = user.app_metadata?.role ?? user.user_metadata?.role ?? "employee";
   const isAdmin = role === "admin";
-  const showSettings = isAdmin && !pathname.startsWith("/admin/settings");
   const initStr = initials(nickname, user.email ?? "");
 
   return (
@@ -137,24 +138,6 @@ export function UserButton() {
               </span>
             </button>
 
-            {/* Global settings — admin only */}
-            {showSettings && (
-              <>
-                <Link
-                  href="/admin/settings/video"
-                  onClick={() => {
-                    rememberSettingsReturn(pathname);
-                    setOpen(false);
-                  }}
-                  className="group flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition-colors hover:bg-muted"
-                >
-                  <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-muted text-muted-foreground group-hover:bg-background">
-                    <Settings className="h-3.5 w-3.5" />
-                  </span>
-                  <span className="font-medium">Settings</span>
-                </Link>
-              </>
-            )}
           </div>
 
         </div>

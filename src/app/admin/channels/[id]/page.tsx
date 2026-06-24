@@ -1,23 +1,39 @@
 "use client";
 
 import { use, useCallback, useEffect, useState } from "react";
-import { Loader2, Save } from "lucide-react";
-import { AdminPageShell } from "@/components/admin-page-shell";
-import { Button } from "@/components/ui/button";
+import Link from "next/link";
+import { ArrowLeft, ChevronDown, Loader2, Save, Sliders } from "lucide-react";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { ErrorAlert } from "@/components/ui/error-alert";
 import { useActiveChannel } from "@/lib/active-channel-context";
+import { PageContainer } from "@/components/ui/page-container";
 
 type Form = {
   name: string;
   handle: string;
   video_style: string;
-  voice_provider: string;
   voice_id: string;
+  voice_speed: string;
+  voice_stability: string;
+  voice_similarity_boost: string;
+  voice_style: string;
   stock_folder: string;
 };
+
+const VOICE_DEFAULTS = {
+  voice_speed: "0.85",
+  voice_stability: "0.6",
+  voice_similarity_boost: "0.75",
+  voice_style: "0.15",
+} as const;
+
+function fieldNumber(value: unknown, fallback: string): string {
+  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isFinite(n) ? String(n) : fallback;
+}
 
 /**
  * Channel "video profile" editor. Sets the voice + visual style the Video
@@ -32,6 +48,7 @@ export default function ChannelEditPage({ params }: { params: Promise<{ id: stri
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState("");
+  const [voiceOpen, setVoiceOpen] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -49,8 +66,11 @@ export default function ChannelEditPage({ params }: { params: Promise<{ id: stri
             : c.video_style
             ? JSON.stringify(c.video_style)
             : "",
-        voice_provider: c.voice_provider ?? "elevenlabs",
         voice_id: c.voice_id ?? "",
+        voice_speed: fieldNumber(c.voice_speed, VOICE_DEFAULTS.voice_speed),
+        voice_stability: fieldNumber(c.voice_stability, VOICE_DEFAULTS.voice_stability),
+        voice_similarity_boost: fieldNumber(c.voice_similarity_boost, VOICE_DEFAULTS.voice_similarity_boost),
+        voice_style: fieldNumber(c.voice_style, VOICE_DEFAULTS.voice_style),
         stock_folder: c.stock_folder ?? "",
       });
     } catch (e) {
@@ -89,13 +109,17 @@ export default function ChannelEditPage({ params }: { params: Promise<{ id: stri
   };
 
   return (
-    <AdminPageShell
-      title="Channel settings"
-      description="The voice and visual style used when this channel renders videos."
-      backHref="/admin/channels"
-      backLabel="Channels"
-      maxWidth="max-w-2xl"
-    >
+    <PageContainer className="max-w-2xl space-y-5">
+      <div className="space-y-4">
+        <Link href="/admin/channels" className={buttonVariants({ variant: "ghost", size: "sm" })}>
+          <ArrowLeft className="h-4 w-4" />
+          Go back
+        </Link>
+        <h1 className="text-[19px] font-semibold leading-tight tracking-normal text-foreground">
+          Channel settings
+        </h1>
+      </div>
+
       {loading || !form ? (
         <div className="flex h-40 items-center justify-center">
           <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
@@ -108,15 +132,16 @@ export default function ChannelEditPage({ params }: { params: Promise<{ id: stri
             <Field label="Channel name">
               <Input value={form.name} onChange={(e) => set("name", e.target.value)} />
             </Field>
-            <Field label="Handle">
-              <Input value={form.handle} onChange={(e) => set("handle", e.target.value)} placeholder="@handle" />
+            <Field label="B-Roll folder">
+              <Input
+                value={form.stock_folder}
+                onChange={(e) => set("stock_folder", e.target.value)}
+                placeholder={form.name}
+              />
             </Field>
           </div>
 
-          <Field
-            label="Video style"
-            hint="Describes the look & mood applied to every scene. Leave blank to use the global default."
-          >
+          <Field label="Video style">
             <Textarea
               value={form.video_style}
               onChange={(e) => set("video_style", e.target.value)}
@@ -125,30 +150,71 @@ export default function ChannelEditPage({ params }: { params: Promise<{ id: stri
             />
           </Field>
 
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="Voice provider" hint="elevenlabs or voice-clone">
-              <Input
-                value={form.voice_provider}
-                onChange={(e) => set("voice_provider", e.target.value)}
-                placeholder="elevenlabs"
-              />
-            </Field>
-            <Field label="Voice ID" hint="The TTS voice for this channel.">
-              <Input
-                value={form.voice_id}
-                onChange={(e) => set("voice_id", e.target.value)}
-                placeholder="Leave blank for default"
-              />
-            </Field>
+          <div className="rounded-lg border border-border bg-card">
+            <button
+              type="button"
+              onClick={() => setVoiceOpen((open) => !open)}
+              className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left"
+            >
+              <span className="inline-flex items-center gap-2 text-sm font-semibold">
+                <Sliders className="h-4 w-4 text-muted-foreground" />
+                Voice settings
+              </span>
+              <ChevronDown className={`h-4 w-4 text-muted-foreground transition ${voiceOpen ? "rotate-180" : ""}`} />
+            </button>
+            {voiceOpen && (
+              <div className="space-y-4 border-t border-border p-4">
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <Field label="Provider">
+                    <div className="flex h-10 items-center rounded-md border border-input bg-muted/35 px-3 text-sm">
+                      ElevenLabs
+                    </div>
+                  </Field>
+                  <Field label="Voice ID">
+                    <Input
+                      value={form.voice_id}
+                      onChange={(e) => set("voice_id", e.target.value)}
+                      placeholder="Leave blank for default"
+                    />
+                  </Field>
+                </div>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <VoiceSlider
+                    label="Speed"
+                    value={form.voice_speed}
+                    min={0.7}
+                    max={1.2}
+                    step={0.01}
+                    onChange={(value) => set("voice_speed", value)}
+                  />
+                  <VoiceSlider
+                    label="Stability"
+                    value={form.voice_stability}
+                    min={0}
+                    max={1}
+                    step={0.01}
+                    onChange={(value) => set("voice_stability", value)}
+                  />
+                  <VoiceSlider
+                    label="Similarity boost"
+                    value={form.voice_similarity_boost}
+                    min={0}
+                    max={1}
+                    step={0.01}
+                    onChange={(value) => set("voice_similarity_boost", value)}
+                  />
+                  <VoiceSlider
+                    label="Style"
+                    value={form.voice_style}
+                    min={0}
+                    max={1}
+                    step={0.01}
+                    onChange={(value) => set("voice_style", value)}
+                  />
+                </div>
+              </div>
+            )}
           </div>
-
-          <Field label="B-Roll folder" hint="Name of this channel's B-Roll subfolder.">
-            <Input
-              value={form.stock_folder}
-              onChange={(e) => set("stock_folder", e.target.value)}
-              placeholder={form.name}
-            />
-          </Field>
 
           <div className="flex items-center justify-end gap-3 border-t border-border pt-4">
             {saved && <span className="text-xs text-emerald-600 dark:text-emerald-400">Saved</span>}
@@ -159,24 +225,58 @@ export default function ChannelEditPage({ params }: { params: Promise<{ id: stri
           </div>
         </div>
       )}
-    </AdminPageShell>
+    </PageContainer>
   );
 }
 
 function Field({
   label,
-  hint,
   children,
 }: {
   label: string;
-  hint?: string;
   children: React.ReactNode;
 }) {
   return (
     <div className="space-y-1.5">
       <Label className="text-xs">{label}</Label>
       {children}
-      {hint && <p className="text-[11px] text-muted-foreground">{hint}</p>}
+    </div>
+  );
+}
+
+function VoiceSlider({
+  label,
+  value,
+  min,
+  max,
+  step,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  min: number;
+  max: number;
+  step: number;
+  onChange: (value: string) => void;
+}) {
+  const numericValue = fieldNumber(value, String(min));
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-3">
+        <Label className="text-xs">{label}</Label>
+        <span className="rounded-md bg-muted px-2 py-0.5 text-xs tabular-nums text-muted-foreground">
+          {Number(numericValue).toFixed(2)}
+        </span>
+      </div>
+      <Input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={numericValue}
+        onChange={(e) => onChange(e.target.value)}
+        className="h-9 cursor-pointer"
+      />
     </div>
   );
 }

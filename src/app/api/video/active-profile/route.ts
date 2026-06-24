@@ -37,7 +37,11 @@ export async function GET(req: Request) {
     description: channel.description,
     video_style: channel.video_style,
     voice_id: channel.voice_id,
-    voice_provider: channel.voice_provider,
+    voice_provider: "elevenlabs",
+    voice_speed: channel.voice_speed,
+    voice_stability: channel.voice_stability,
+    voice_similarity_boost: channel.voice_similarity_boost,
+    voice_style: channel.voice_style,
     stock_folder: channel.stock_folder,
   });
   const preset = getPromptPreset(presetId);

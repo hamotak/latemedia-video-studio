@@ -4,7 +4,7 @@ import db from "@/lib/video-engine/db";
 import { getLogs } from "@/lib/video-engine/logger";
 import { ensureInit } from "@/lib/video-engine/init";
 import { getRunDir } from "@/lib/video-engine/run-paths";
-import { isRunWorkerActive } from "@/lib/video-engine/pipeline";
+import { isRunWorkerActive, reconcileDeadVideoWorkers } from "@/lib/video-engine/pipeline";
 import { driveFileLink, driveFolderLink } from "@/lib/video-engine/services/drive-workspace";
 import { requireVideoRunAccess } from "@/lib/video-access";
 
@@ -24,6 +24,7 @@ export async function GET(_: Request, ctx: { params: Promise<{ id: string }> }) 
       { status: access.status }
     );
   }
+  reconcileDeadVideoWorkers(id);
   const run = getRun.get(id) as Record<string, unknown> | undefined;
   if (!run) return NextResponse.json({ error: "not found" }, { status: 404 });
   const dbStatus = String(run.status ?? "");

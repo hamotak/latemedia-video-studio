@@ -1,17 +1,17 @@
-# Late Media Video Studio — guide for Claude
+# Bilal Demo Video Generation — guide for Claude
 
 This is a **standalone, local, single-user** Next.js app for generating videos from a script. There is **no login, no auth, and no cloud database** — it runs as one built-in admin and stores everything in a local SQLite database under `./data/`.
 
 ## Run it
 
 - Install deps (first time): `npm install`
-- Start: `npm run dev` → serves on **http://localhost:2000** (the port is fixed in `package.json`).
-- Production: `npm run build && npm start` (also port 2000).
+- Start: `npm run dev` → serves on **http://localhost:3000** (the port is fixed in `package.json`).
+- Production: `npm run build && npm start` (also port 3000).
 - **Node 20+** required. FFmpeg is bundled via `ffmpeg-static` / `ffprobe-static` — never tell the user to install FFmpeg.
 
 ## First-run setup
 
-1. Open http://localhost:2000 — it lands on the **Video** studio.
+1. Open http://localhost:3000 — it lands on the **Video** studio.
 2. Go to **Settings** (sidebar) and have the user paste their API keys:
    - `LABS69_API_KEY` (69labs) and `GOOGLE_API_KEY` (Gemini) are **required**.
    - `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` are optional fallbacks.

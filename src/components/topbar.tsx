@@ -15,6 +15,7 @@ function isStudioRoute(pathname: string) {
     "/video",
     "/channel-info",
     "/admin/channels",
+    "/admin/settings",
     "/admin/boards",
     "/admin/board",
     "/admin/create",
@@ -32,7 +33,7 @@ export function Topbar() {
   const showChannelSwitcher = isStudioRoute(pathname);
 
   return (
-    <header className="flex h-12 items-center justify-between gap-2 border-b border-border bg-background/95 px-3 backdrop-blur sm:px-4">
+    <header className="relative z-50 flex h-12 items-center justify-between gap-2 border-b border-border bg-background/95 px-3 backdrop-blur sm:px-4">
       <div className="flex min-w-0 items-center gap-2">
         <Button
           variant="ghost"

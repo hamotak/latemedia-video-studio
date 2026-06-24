@@ -6,7 +6,6 @@ import {
   type StockGenClipStep,
   type StockGenStatus,
 } from "@/lib/video-engine/services/stock-gen";
-import { driveFileLink } from "@/lib/video-engine/services/drive-workspace";
 import { requireVideoEditUser } from "@/lib/video-access";
 import { loadAppSettingsIntoCache } from "@/lib/app-settings-store";
 import { loadProviderSecretsIntoCache } from "@/lib/provider-secrets-store";
@@ -110,7 +109,7 @@ export function publicStockGenStatus(status: StockGenStatus): PublicStockGenStat
         ...publicClip
       } = clip;
       const displayName = clip.displayName || stockClipDisplayName(clip.index);
-      const driveLink = clip.driveFileLink ?? (clip.driveFileId ? driveFileLink(clip.driveFileId) : null);
+      const driveLink = clip.driveFileLink !== undefined ? clip.driveFileLink : null;
       const videoUrl = clip.driveFileId
         ? `/api/video/stock/file?id=${encodeURIComponent(clip.driveFileId)}`
         : clip.videoPath

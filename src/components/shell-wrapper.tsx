@@ -9,7 +9,7 @@ import { cn } from "@/lib/utils";
 export function ShellWrapper({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
 
-  if (pathname === "/admin" || pathname === "/admin/channels/new" || pathname.startsWith("/admin/settings")) {
+  if (pathname === "/admin" || pathname === "/admin/channels/new") {
     return (
       <ActiveChannelProvider>
         <div className="min-h-screen bg-background">

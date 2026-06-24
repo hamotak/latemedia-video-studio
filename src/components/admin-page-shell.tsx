@@ -44,12 +44,19 @@ export function AdminPageShell({
       <ArrowLeft className="h-4 w-4" />
       {backLabel ?? "Back"}
     </Link>
+  ) : title === "Dashboard" ? (
+    <a
+      href="https://youtube.com/shorts/5kIdZkwvx_Y"
+      className="gold-brand-shine inline-flex min-h-9 max-w-[min(760px,calc(100vw-7rem))] items-center gap-2 overflow-hidden rounded-[6px] px-2.5 text-base font-extrabold leading-tight sm:text-lg"
+    >
+      <span className="gold-brand-label truncate">ZALATOY insan, Bilal bey ucun hazirlanib</span>
+    </a>
   ) : (
     <Link
       href="/admin"
       className="inline-flex h-7 items-center rounded-[5px] px-2 text-xs font-semibold text-foreground transition-colors hover:bg-muted"
     >
-      Late Media
+      Bilal Demo
     </Link>
   );
 

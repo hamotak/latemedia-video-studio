@@ -1,4 +1,3 @@
-import { createServerClient } from "@supabase/ssr";
 import { NextRequest, NextResponse } from "next/server";
 
 export async function proxy(req: NextRequest) {
@@ -9,52 +8,8 @@ export async function proxy(req: NextRequest) {
     return NextResponse.redirect(url);
   }
 
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-
-  // No Supabase configured — pass through (local dev without auth)
-  if (!supabaseUrl || !supabaseKey) return NextResponse.next();
-
-  const { pathname } = req.nextUrl;
-
-  // Auth API routes are always public
-  if (pathname.startsWith("/api/auth/")) return NextResponse.next();
-
-  let res = NextResponse.next({ request: req });
-
-  const supabase = createServerClient(supabaseUrl, supabaseKey, {
-    cookies: {
-      getAll: () => req.cookies.getAll(),
-      setAll: (cookiesToSet) =>
-        cookiesToSet.forEach(({ name, value, options }) =>
-          res.cookies.set(name, value, options)
-        ),
-    },
-  });
-
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  if (pathname === "/login") {
-    // Already authenticated — bounce to home
-    if (user) return NextResponse.redirect(new URL("/", req.url));
-    return NextResponse.next();
-  }
-
-  if (!user) {
-    return NextResponse.redirect(new URL("/login", req.url));
-  }
-
-  // Admin-only routes — non-admins get bounced to home
-  if (pathname.startsWith("/admin")) {
-    const role = user.app_metadata?.role;
-    if (role !== "admin") {
-      return NextResponse.redirect(new URL("/", req.url));
-    }
-  }
-
-  return res;
+  // Standalone build: no auth gateway, no cloud database, one local admin.
+  return NextResponse.next();
 }
 
 export const config = {

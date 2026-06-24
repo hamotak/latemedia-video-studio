@@ -2,7 +2,12 @@ import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import db from "@/lib/video-engine/db";
 import { ensureInit } from "@/lib/video-engine/init";
-import { isRunWorkerActive, startRunPipeline } from "@/lib/video-engine/pipeline";
+import {
+  checkVideoWorkerBootstrap,
+  isRunWorkerActive,
+  reconcileDeadVideoWorkers,
+  startRunPipeline,
+} from "@/lib/video-engine/pipeline";
 import { sanitizeFolderName, pickAvailableFolderName } from "@/lib/video-engine/run-paths";
 import { getPromptPreset } from "@/lib/video-engine/prompts";
 import { resolveChannelStockFolder, resolveHybridFreshMinutes } from "@/lib/video-engine/channel-stock";
@@ -49,7 +54,11 @@ function ensureChannelPresetId(channel: Channel | null): number | null {
     description: channel.description,
     video_style: channel.video_style,
     voice_id: channel.voice_id,
-    voice_provider: channel.voice_provider,
+    voice_provider: "elevenlabs",
+    voice_speed: channel.voice_speed,
+    voice_stability: channel.voice_stability,
+    voice_similarity_boost: channel.voice_similarity_boost,
+    voice_style: channel.voice_style,
     stock_folder: channel.stock_folder,
   });
 }
@@ -72,6 +81,7 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
   ensureInit();
+  reconcileDeadVideoWorkers();
   const channel = gate.channel;
   const activePresetId = ensureChannelPresetId(channel);
   if (!activePresetId) return NextResponse.json([]);
@@ -265,6 +275,17 @@ export async function POST(req: Request) {
   if (!mode) {
     return NextResponse.json({ error: "Unsupported video mode. Use Hybrid or Image cut." }, { status: 400 });
   }
+  const workerReady = checkVideoWorkerBootstrap();
+  if (!workerReady.ok) {
+    return NextResponse.json(
+      {
+        error: "Video generation worker could not start. Fix the local worker error before starting a run.",
+        errorKind: "worker_bootstrap_failed",
+        detail: workerReady.error,
+      },
+      { status: 500 }
+    );
+  }
   const requestedHybridFresh =
     typeof body.hybridFreshMinutes === "number" && body.hybridFreshMinutes > 0
       ? body.hybridFreshMinutes
@@ -324,13 +345,7 @@ export async function POST(req: Request) {
   void mirrorVideoRun(id, {
     channelId: gate.channelId,
     createdBy: gate.user.id,
-  }).catch((e) => {
-    const message = e instanceof Error ? e.message : String(e);
-    log(id, "warn", `Supabase metadata mirror failed: ${message}`, {
-      stage: "supabase",
-      data: { channelId: gate.channelId },
-    });
-  });
+  }).catch(() => {});
 
   // Start the local worker in the background. The worker registry prevents
   // duplicate starts if the UI retries quickly.

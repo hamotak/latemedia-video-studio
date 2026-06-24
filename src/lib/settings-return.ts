@@ -1,4 +1,4 @@
-const KEY = "late-media-settings-return-to";
+const KEY = "bilal-demo-settings-return-to:v1";
 
 function safePath(path: string | null | undefined) {
   const value = path?.trim();
@@ -15,4 +15,9 @@ export function rememberSettingsReturn(path: string | null | undefined) {
 export function getSettingsReturn() {
   if (typeof window === "undefined") return "/admin";
   return safePath(window.localStorage.getItem(KEY));
+}
+
+export function currentSettingsReturnPath() {
+  if (typeof window === "undefined") return "/admin";
+  return safePath(`${window.location.pathname}${window.location.search}`);
 }

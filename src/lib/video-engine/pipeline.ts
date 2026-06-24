@@ -1,7 +1,7 @@
 import path from "node:path";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import db from "./db";
 import { log } from "./logger";
 import { getSetting } from "./settings";
@@ -61,12 +61,19 @@ const updateRun = db.prepare(
   "UPDATE runs SET status = ?, output_path = ?, updated_at = datetime('now') WHERE id = ?"
 );
 const getRunStatusStmt = db.prepare("SELECT status FROM runs WHERE id = ?");
+const listPotentialDeadWorkerRunsStmt = db.prepare(
+  "SELECT id FROM runs WHERE status IN ('pending','running') AND output_path IS NULL"
+);
 
 const activeRunWorkers = new Map<string, string>();
 const WORKER_STALE_MS = 2 * 60 * 1000;
 
 function workerHeartbeatPath(runId: string): string {
   return path.join(getRunDir(runId), ".worker-active.json");
+}
+
+function workerLogPath(runId: string): string {
+  return path.join(getRunDir(runId), "worker.log");
 }
 
 function touchWorkerHeartbeat(runId: string, token: string) {
@@ -86,6 +93,14 @@ function removeWorkerHeartbeat(runId: string, token: string) {
     fs.rmSync(workerHeartbeatPath(runId), { force: true });
   } catch {
     /* ignore */
+  }
+}
+
+function clearWorkerHeartbeat(runId: string) {
+  try {
+    fs.rmSync(workerHeartbeatPath(runId), { force: true });
+  } catch {
+    /* heartbeat cleanup is best-effort */
   }
 }
 
@@ -137,6 +152,7 @@ function checkWorkerOwnership(runId: string, token?: string): void {
 }
 
 type VideoWorkerAction = "run" | "resume";
+type WorkerBootstrapResult = { ok: true } | { ok: false; error: string };
 
 async function runWorkerWithHeartbeat(
   runId: string,
@@ -164,6 +180,67 @@ function videoWorkerScriptPath(): string {
   return path.join(process.cwd(), "scripts", "video-worker.cjs");
 }
 
+function compactWorkerOutput(value: string | null | undefined): string {
+  const text = (value ?? "").trim();
+  if (!text) return "";
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  return lines.slice(-16).join("\n").slice(0, 1800);
+}
+
+export function checkVideoWorkerBootstrap(): WorkerBootstrapResult {
+  const result = spawnSync(process.execPath, [videoWorkerScriptPath(), "self-test"], {
+    cwd: process.cwd(),
+    env: { ...process.env },
+    encoding: "utf8",
+    timeout: 15_000,
+  });
+  if (result.error) {
+    return { ok: false, error: result.error.message };
+  }
+  if (result.status === 0) return { ok: true };
+  const output = compactWorkerOutput(result.stderr) || compactWorkerOutput(result.stdout);
+  const status = result.signal ? `signal ${result.signal}` : `exit ${result.status ?? "unknown"}`;
+  return {
+    ok: false,
+    error: output ? `Worker self-test failed (${status}): ${output}` : `Worker self-test failed (${status}).`,
+  };
+}
+
+function readWorkerLogFailure(runId: string): string | null {
+  let text: string;
+  try {
+    text = fs.readFileSync(workerLogPath(runId), "utf-8");
+  } catch {
+    return null;
+  }
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const fatalIndex = lines.findLastIndex((line) =>
+    /(ReferenceError|SyntaxError|TypeError|Cannot find module|ERR_|Error:|UnhandledPromiseRejection)/i.test(line)
+  );
+  if (fatalIndex < 0) return null;
+  return lines.slice(Math.max(0, fatalIndex - 2), fatalIndex + 10).join("\n").slice(0, 1800);
+}
+
+export function reconcileDeadVideoWorkers(runId?: string): number {
+  const rows = runId
+    ? [{ id: runId }]
+    : (listPotentialDeadWorkerRunsStmt.all() as Array<{ id: string }>);
+  let marked = 0;
+  for (const row of rows) {
+    if (!row.id || isRunWorkerActive(row.id) || hasRecentRunFiles(row.id)) continue;
+    const failure = readWorkerLogFailure(row.id);
+    if (!failure) continue;
+    updateRun.run("error", null, row.id);
+    clearWorkerHeartbeat(row.id);
+    marked++;
+    log(row.id, "error", `Video worker stopped before generation could continue: ${failure}`, {
+      stage: "pipeline",
+    });
+    void mirrorVideoRun(row.id, { error: failure }).catch(() => {});
+  }
+  return marked;
+}
+
 async function hydrateWorkerRuntimeConfig(runId: string): Promise<void> {
   const results = await Promise.allSettled([
     loadProviderSecretsIntoCache(),
@@ -189,18 +266,25 @@ function startRunWorker(runId: string, action: VideoWorkerAction): { started: bo
   ) {
     return { started: false, active: true };
   }
+  const bootstrap = checkVideoWorkerBootstrap();
+  if (!bootstrap.ok) {
+    log(runId, "error", `Could not start video worker: ${bootstrap.error}`, { stage: "pipeline" });
+    updateRun.run("error", null, runId);
+    void mirrorVideoRun(runId, { error: bootstrap.error }).catch(() => {});
+    return { started: false, active: false };
+  }
   const token = randomUUID();
   touchWorkerHeartbeat(runId, token);
   const runDir = getRunDir(runId);
-  const workerLogPath = path.join(runDir, "worker.log");
+  const workerLog = workerLogPath(runId);
   let workerLogFd: number | null = null;
   try {
     fs.appendFileSync(
-      workerLogPath,
+      workerLog,
       `\n[${new Date().toISOString()}] starting ${action} worker for ${runId}\n`,
       "utf-8"
     );
-    workerLogFd = fs.openSync(workerLogPath, "a");
+    workerLogFd = fs.openSync(workerLog, "a");
     const child = spawn(process.execPath, [videoWorkerScriptPath(), action, runId, token], {
       cwd: process.cwd(),
       detached: true,

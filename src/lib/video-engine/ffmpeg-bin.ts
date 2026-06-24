@@ -1,6 +1,7 @@
 import "server-only";
 import fs from "node:fs";
-import { createRequire } from "node:module";
+import ffmpegStatic from "ffmpeg-static";
+import ffprobeStatic from "ffprobe-static";
 
 /**
  * Resolves the ffmpeg / ffprobe executables that ship with the app via the
@@ -10,8 +11,6 @@ import { createRequire } from "node:module";
  * An explicit `FFMPEG_PATH` set in Settings always takes precedence (resolved
  * by the callers); these helpers are the zero-config fallback.
  */
-const requireCjs = createRequire(import.meta.url);
-
 function existing(value: unknown): string | null {
   const resolved =
     typeof value === "string" ? value : (value as { path?: string } | null)?.path;
@@ -22,18 +21,10 @@ function existing(value: unknown): string | null {
 
 /** Absolute path to the bundled ffmpeg binary, or null if unavailable. */
 export function bundledFfmpeg(): string | null {
-  try {
-    return existing(requireCjs("ffmpeg-static"));
-  } catch {
-    return null;
-  }
+  return existing(ffmpegStatic);
 }
 
 /** Absolute path to the bundled ffprobe binary, or null if unavailable. */
 export function bundledFfprobe(): string | null {
-  try {
-    return existing(requireCjs("ffprobe-static"));
-  } catch {
-    return null;
-  }
+  return existing(ffprobeStatic);
 }

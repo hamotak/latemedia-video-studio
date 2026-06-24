@@ -1,7 +1,7 @@
 /**
  * Role-based permission matrix (handoff spec — "follow this for now").
  *
- * A user's trusted role lives on their Supabase user: `app_metadata.role`.
+ * A user's trusted role lives on the local admin identity: `app_metadata.role`.
  * Only "admin" has global/elevated access;
  * the others are scoped per the matrix below. Channel assignment scoping
  * (who sees which channels) is enforced separately — this module only
@@ -22,11 +22,10 @@ export function normalizeRole(role: string | null | undefined): string {
 }
 
 /**
- * The trusted role for a Supabase user. `app_metadata.role` is the only source
- * of truth because it is writable only by the service role (admin endpoints).
+ * The trusted role for the current local user. `app_metadata.role` is the only
+ * source of truth for compatibility with the old route gates.
  *
- * Accepts the minimal shape both the server (`@supabase/supabase-js` User)
- * and client (`getUser()` data) expose.
+ * Accepts the minimal shape both server and client auth helpers expose.
  */
 export function extractRole(
   user:

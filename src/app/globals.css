@@ -123,6 +123,31 @@
   box-shadow: var(--shadow-card);
 }
 
+.gold-brand-shine {
+  color: #f0bd3d;
+  text-decoration: none;
+  text-shadow: 0 1px 0 rgb(255 244 190 / 0.18);
+  transition: color 160ms ease, transform 160ms ease;
+}
+
+.gold-brand-shine:hover {
+  transform: translateY(-1px);
+}
+
+.gold-brand-label {
+  background: linear-gradient(
+    100deg,
+    #d7971e 0%,
+    #f3c64c 35%,
+    #fff1a8 50%,
+    #e2a625 64%,
+    #f6d46b 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
 .studio-history-rail {
   left: -15rem !important;
 }

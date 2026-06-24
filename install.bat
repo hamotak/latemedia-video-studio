@@ -4,7 +4,7 @@ cd /d "%~dp0"
 
 echo.
 echo ====================================
-echo  Late Media Video Studio - Installation
+echo  Bilal Demo Video Generation - Installation
 echo ====================================
 echo.
 

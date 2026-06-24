@@ -9,7 +9,7 @@ import { parseOptionalChannelId } from "../generate/_shared";
 
 export const runtime = "nodejs";
 
-/** POST /api/video/stock/delete  { ids: string[] } — move clips to Drive trash. */
+/** POST /api/video/stock/delete  { ids: string[] } — remove clips from the local B-roll library. */
 export async function POST(req: Request) {
   const parsed = tryParseJson(await req.text());
   if (!parsed.ok || !isJsonObject(parsed.value)) {
@@ -45,6 +45,6 @@ export async function POST(req: Request) {
       errors.push(`${id}: ${e instanceof Error ? e.message : String(e)}`.slice(0, 120));
     }
   }
-  const jobsUpdated = markStockClipsDeletedByDriveIds(trashedDriveIds);
+  const jobsUpdated = markStockClipsDeletedByDriveIds([...trashedDriveIds, ...ids.filter(isBRollClipId)]);
   return NextResponse.json({ deleted, localDeleted, failed: errors.length, errors, jobsUpdated });
 }

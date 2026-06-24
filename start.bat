@@ -22,7 +22,7 @@ if not exist "node_modules" (
 
 echo.
 echo ====================================
-echo  Starting Late Media Video Studio...
+echo  Starting Bilal Demo Video Generation...
 echo  The app will open in your browser.
 echo  Close this window to stop the server.
 echo ====================================
@@ -33,5 +33,5 @@ REM PowerShell handles the delay + browser launch in one detached process.
 REM (Earlier attempts using nested `cmd /c "... start \"\" \"...\""` blew up
 REM with `\\` being interpreted as a UNC root — "Windows cannot find '\\'"
 REM plus an "Access is denied." message in the terminal.)
-start "" /b powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Seconds 5; Start-Process 'http://localhost:2000'"
+start "" /b powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Seconds 5; Start-Process 'http://localhost:3000'"
 call npm run dev

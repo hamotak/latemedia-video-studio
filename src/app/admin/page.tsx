@@ -29,8 +29,6 @@ import {
   Plus,
   RefreshCw,
   Settings,
-  Tv2,
-  UserRound,
   Users,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -139,13 +137,9 @@ export default function AdminPage() {
     }
   };
 
-  const totals = data?.totals;
-  const users = data?.users;
-
   return (
     <AdminPageShell
       title="Dashboard"
-      description="Open the studio, manage channels, and keep the workspace configured."
       action={
         <Button variant="outline" size="sm" onClick={load} disabled={loading}>
           <RefreshCw className={cn("h-3.5 w-3.5", loading && "animate-spin")} />
@@ -153,7 +147,7 @@ export default function AdminPage() {
         </Button>
       }
     >
-      <div className="flex flex-col gap-8">
+      <div className="flex flex-col gap-5">
 
         <section className="grid gap-3 md:grid-cols-2">
           <Link
@@ -185,11 +179,6 @@ export default function AdminPage() {
         </section>
 
         {error && <ErrorAlert message={error} onRetry={load} />}
-
-        <section className="grid gap-3 sm:grid-cols-2">
-          <Stat label="Channels" value={totals?.channels} Icon={Tv2} loading={loading} />
-          <Stat label="Employees" value={users?.employees} Icon={UserRound} loading={loading} />
-        </section>
 
         <section className="space-y-3">
           <div className="flex items-center justify-between gap-3">
@@ -312,15 +301,7 @@ function SortableChannelRow({
           </div>
         )}
         <div className="min-w-0 flex-1">
-          <div className="flex min-w-0 items-center gap-2">
-            <p className="truncate font-medium">{channel.name}</p>
-            <span className="shrink-0 rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-muted-foreground">
-              {typeof channel.subscriber_count === "number" ? formatCompact(channel.subscriber_count) : "—"} subs
-            </span>
-          </div>
-          {channel.handle && (
-            <p className="truncate text-xs text-muted-foreground">{channel.handle}</p>
-          )}
+          <p className="truncate font-medium">{channel.name}</p>
         </div>
         {opening ? (
           <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -328,34 +309,6 @@ function SortableChannelRow({
           <ArrowRight className="h-4 w-4 text-muted-foreground/50 transition group-hover:translate-x-0.5 group-hover:text-primary" />
         )}
       </button>
-    </div>
-  );
-}
-
-function formatCompact(value: number) {
-  return Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(value);
-}
-
-function Stat({
-  label,
-  value,
-  Icon,
-  loading,
-}: {
-  label: string;
-  value: number | undefined;
-  Icon: typeof Tv2;
-  loading: boolean;
-}) {
-  return (
-    <div className="rounded-xl border border-border bg-card p-4">
-      <div className="flex items-center justify-between">
-        <span className="text-xs text-muted-foreground">{label}</span>
-        <Icon className="h-4 w-4 text-muted-foreground" />
-      </div>
-      <p className="mt-2 text-2xl font-semibold tabular-nums">
-        {loading || value === undefined ? "—" : value.toLocaleString()}
-      </p>
     </div>
   );
 }

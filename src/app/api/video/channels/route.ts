@@ -61,7 +61,7 @@ export async function POST(req: Request) {
       voice_similarity_boost: body.voice_similarity_boost,
       voice_style: body.voice_style,
       voice_id: body.voice_id,
-      voice_provider: body.voice_provider,
+      voice_provider: "elevenlabs",
       stock_folder: body.stock_folder,
       hybrid_fresh_minutes: body.hybrid_fresh_minutes,
     });

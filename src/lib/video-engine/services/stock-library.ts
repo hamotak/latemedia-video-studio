@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { drive_v3 } from "googleapis";
 import { DATA_DIR } from "../run-paths";
 import db from "../db";
 import { DRIVE_ROOT_FOLDER } from "../app-meta";
@@ -22,19 +21,15 @@ import {
 } from "./drive-workspace";
 import { log } from "../logger";
 import { mergeDriveAndLocalStockClips } from "../stock-merge";
+import { channelBRollsDir, listBRollClipRows, resolveBRollClipPath } from "../local-output";
 
 /**
- * Stock / B-roll library backed by Google Drive.
+ * Stock / B-roll library for the standalone app.
  *
- * Library clips live in Drive at
- * Late Media Editing Tool / Channels / <channel> / <channel> B-rolls.
- * Old channel folders and legacy Clips Library folders are quarantined by default.
- * The hybrid pipeline (see pipeline.ts) uses these to fill the
- * long tail of a sleep video instead of generating fresh clips: the first few
- * minutes are bespoke AI, the rest is locally cached stock B-roll.
- *
- * Drive is the source of truth so the local machine never bloats: each clip is
- * downloaded ONCE into a local cache and reused on every later run.
+ * The canonical clips live as plain local files under
+ * ~/Desktop/Late Media Videos/<Channel>/B-Rolls. Legacy Drive helpers remain
+ * below for old migration endpoints, but the active video pipeline reads the
+ * local B-roll folder first and does not require Drive.
  */
 
 export interface StockClip {
@@ -82,6 +77,19 @@ export interface LegacyStockMigrationSource {
   clipCount: number;
 }
 
+type LegacyDriveFileList = {
+  data: {
+    nextPageToken?: string | null;
+    files?: Array<{
+      id?: string | null;
+      name?: string | null;
+      mimeType?: string | null;
+      createdTime?: string | null;
+      modifiedTime?: string | null;
+    }>;
+  };
+};
+
 export interface LegacyStockMigrationResult {
   dryRun: boolean;
   targetFolderId: string;
@@ -115,6 +123,8 @@ export function isLocalStockClipId(id: string): boolean {
 
 export function resolveLocalStockClipPath(id: string): string {
   if (!isLocalStockClipId(id)) throw new Error("Not a local stock clip id");
+  const brollPath = resolveBRollClipPath(id);
+  if (brollPath) return brollPath;
   let rel: string;
   try {
     rel = Buffer.from(id.slice("local:".length), "base64url").toString("utf-8");
@@ -155,7 +165,7 @@ async function listVideoFiles(
   const clips: StockClip[] = [];
   let pageToken: string | undefined;
   do {
-    const res: { data: drive_v3.Schema$FileList } = await drive.files.list({
+    const res: LegacyDriveFileList = await drive.files.list({
       q: `'${folderId}' in parents and trashed=false and mimeType contains 'video/'`,
       fields: "nextPageToken, files(id, name, createdTime, modifiedTime)",
       pageSize: 1000,
@@ -365,20 +375,16 @@ export async function migrateLegacyChannelStockClips(
   };
 }
 
-/** List all .mp4 clips in the stock library folder on Drive. */
+/** List all clips in the standalone stock library. */
 export async function listStockClips(
   folder: string,
   options: { channelName?: string | null } = {}
 ): Promise<StockClip[]> {
-  const drive = getDriveClient();
-  if (!drive) throw new Error("Google Drive is not connected — connect it in Settings to use the stock library.");
-
   if (options.channelName) {
-    return (await listChannelStockClips(options.channelName, { legacyFolders: [folder] })).clips;
+    return listBRollClipRows(options.channelName).map((row) => row.clip);
   }
 
-  const folderId = await resolveFolderId(folder);
-  return listVideoFiles(folderId);
+  return listLocalCachedClips(folder).map((row) => row.clip);
 }
 
 /**
@@ -386,6 +392,10 @@ export async function listStockClips(
  * first use. Returns the absolute local path. Reused on every later run.
  */
 export async function ensureStockClipCached(folder: string, clip: StockClip): Promise<string> {
+  const localPath = resolveBRollClipPath(clip.driveFileId);
+  if (localPath) return localPath;
+  if (isLocalStockClipId(clip.driveFileId)) return resolveLocalStockClipPath(clip.driveFileId);
+
   const drive = getDriveClient();
   if (!drive) throw new Error("Google Drive is not connected.");
   const dir = cacheDir(folder);
@@ -505,69 +515,28 @@ export function isDriveAuthError(msg: string): boolean {
 }
 
 /**
- * Pre-warm the local cache for an entire stock library (parallel, best-effort).
- * Falls back to clips already on disk when Drive auth fails but cache exists.
+ * Resolve the local B-roll library for Hybrid tail assembly.
  */
 export async function cacheStockLibrary(
   runId: string,
   folder: string,
   concurrency = 4
 ): Promise<{ clip: StockClip; localPath: string }[]> {
-  let clips: StockClip[];
+  void concurrency;
   const runChannel = (getRunChannelStmt.get(runId) as { preset_name: string | null } | undefined)?.preset_name ?? null;
-  try {
-    clips = await listStockClips(folder, { channelName: runChannel });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (isDriveAuthError(msg)) {
-      const local = listLocalCachedClips(folder);
-      if (local.length > 0) {
-        log(
-          runId,
-          "warn",
-          `Google Drive session expired; using ${local.length} locally cached "${folder}" stock clips.`,
-          { stage: "reuse" },
-        );
-        return local;
-      }
-      throw new Error(
-        `Google Drive session expired (invalid_grant). Open Settings and reconnect Google Drive before using stock clips.`
-      );
-    }
-    throw e;
-  }
-
-  if (clips.length === 0) {
-    const driveFolderName = runChannel ? channelStockBrollFolderName(runChannel) : DRIVE_STOCK_BROLL_FOLDER;
-    throw new Error(
-      `The "${folder}" stock library is empty on Drive (${DRIVE_ROOT_FOLDER} / Channels / ${runChannel ?? "_No Channel"} / ${driveFolderName}). Add clips first.`
-    );
-  }
-  log(runId, "info", `Stock library "${folder}": ${clips.length} clips on Drive — caching locally`, {
-    stage: "reuse",
-  });
-
-  const out: { clip: StockClip; localPath: string }[] = [];
-
-  let i = 0;
-  async function worker() {
-    while (i < clips.length) {
-      const clip = clips[i++];
-      try {
-        const localPath = await ensureStockClipCached(folder, clip);
-        out.push({ clip, localPath });
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        log(runId, "warn", `Stock clip "${clip.name}" cache failed: ${msg.slice(0, 100)}`, { stage: "reuse" });
-      }
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(concurrency, clips.length) }, worker));
+  const out = runChannel ? listBRollClipRows(runChannel) : listLocalCachedClips(folder);
   if (out.length === 0) {
+    const target = runChannel ? channelBRollsDir(runChannel) : path.join(DATA_DIR, "library-cache", folder);
+    const label = runChannel ? `"${runChannel}"` : `"${folder}"`;
     throw new Error(
-      `Could not load any stock clips for "${folder}". Reconnect Google Drive in Settings or check the local cache folder.`
+      `No local B-rolls found for ${label}. ` +
+        `Open the B-Rolls page and generate a batch before starting a Hybrid run. ` +
+        `Expected folder: ${target}`
     );
   }
-  log(runId, "success", `Stock library cached: ${out.length}/${clips.length} clips ready`, { stage: "reuse" });
+  log(runId, "success", `Local B-roll library ready: ${out.length} clip${out.length === 1 ? "" : "s"} available`, {
+    stage: "reuse",
+    data: { channel: runChannel, folder },
+  });
   return out;
 }

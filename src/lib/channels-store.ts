@@ -31,6 +31,10 @@ export type Channel = {
   // Production profile (editing tool)
   voice_provider: string | null;
   voice_id: string | null;
+  voice_speed: number | null;
+  voice_stability: number | null;
+  voice_similarity_boost: number | null;
+  voice_style: number | null;
   video_style: unknown;
   image_prompt: string | null;
   stock_folder: string | null;
@@ -82,6 +86,10 @@ db.exec(`
     brand_topics TEXT,
     voice_provider TEXT,
     voice_id TEXT,
+    voice_speed REAL,
+    voice_stability REAL,
+    voice_similarity_boost REAL,
+    voice_style REAL,
     video_style TEXT,
     image_prompt TEXT,
     stock_folder TEXT,
@@ -104,6 +112,21 @@ db.exec(`
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 `);
+
+function ensureChannelColumn(name: string, definition: string): void {
+  const cols = db.prepare("PRAGMA table_info(channels)").all() as { name: string }[];
+  if (!cols.some((col) => col.name === name)) {
+    db.prepare(`ALTER TABLE channels ADD COLUMN ${name} ${definition}`).run();
+  }
+}
+
+ensureChannelColumn("voice_speed", "REAL");
+ensureChannelColumn("voice_stability", "REAL");
+ensureChannelColumn("voice_similarity_boost", "REAL");
+ensureChannelColumn("voice_style", "REAL");
+db.prepare(
+  "UPDATE channels SET voice_provider = 'elevenlabs' WHERE voice_provider IS NULL OR lower(trim(voice_provider)) <> 'elevenlabs'"
+).run();
 
 /** Columns whose values are stored as JSON text and parsed back into objects. */
 const JSON_COLUMNS = new Set([
@@ -182,8 +205,8 @@ export async function createChannel(input: {
   const info = db
     .prepare(
       `INSERT INTO channels
-        (display_order, name, handle, youtube_channel_id, avatar_url, description, subscriber_count, video_count)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        (display_order, name, handle, youtube_channel_id, avatar_url, description, voice_provider, subscriber_count, video_count)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       nextDisplayOrder(),
@@ -192,6 +215,7 @@ export async function createChannel(input: {
       input.youtube_channel_id ?? null,
       input.avatar_url ?? null,
       input.description ?? null,
+      "elevenlabs",
       input.subscriber_count ?? null,
       input.video_count ?? null
     );

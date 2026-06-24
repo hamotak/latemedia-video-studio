@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { Plus, Tv2, Clapperboard, RefreshCw, Pencil } from "lucide-react";
+import { Plus, Tv2, RefreshCw, Pencil, Trash2, Loader2 } from "lucide-react";
+import { useState } from "react";
 import { useActiveChannel } from "@/lib/active-channel-context";
 import { PageContainer } from "@/components/ui/page-container";
 import { PageHeader } from "@/components/ui/page-header";
@@ -16,12 +17,30 @@ import { cn } from "@/lib/utils";
  */
 export default function AdminChannelsPage() {
   const { channels, activeChannelId, switchChannel, refresh, loading } = useActiveChannel();
+  const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
+  const [deletingId, setDeletingId] = useState<number | null>(null);
+  const [error, setError] = useState("");
+
+  const deleteChannel = async (channelId: number) => {
+    setDeletingId(channelId);
+    setError("");
+    try {
+      const res = await fetch(`/api/studio/channels/${channelId}`, { method: "DELETE" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? "Could not delete channel.");
+      setConfirmDeleteId(null);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not delete channel.");
+    } finally {
+      setDeletingId(null);
+    }
+  };
 
   return (
     <PageContainer className="max-w-4xl space-y-5">
       <PageHeader
         title="Channels"
-        description="Each channel keeps its own voice and visual style for video generation."
         action={
           <div className="flex gap-2">
             <Button variant="outline" size="sm" onClick={() => void refresh()}>
@@ -35,6 +54,12 @@ export default function AdminChannelsPage() {
           </div>
         }
       />
+
+      {error && (
+        <p className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {error}
+        </p>
+      )}
 
       {loading ? (
         <div className="h-40 animate-pulse rounded-xl bg-muted/40" />
@@ -76,9 +101,6 @@ export default function AdminChannelsPage() {
                 )}
                 <div className="min-w-0 flex-1">
                   <p className="truncate font-medium">{channel.name}</p>
-                  {channel.handle && (
-                    <p className="truncate text-xs text-muted-foreground">{channel.handle}</p>
-                  )}
                 </div>
                 {active ? (
                   <span className="rounded-full bg-primary/15 px-2.5 py-1 text-xs font-medium text-primary">
@@ -96,13 +118,37 @@ export default function AdminChannelsPage() {
                   <Pencil className="h-4 w-4" />
                   Edit
                 </Link>
-                <Link
-                  href="/studio/video"
-                  className={buttonVariants({ variant: "ghost", size: "sm" })}
-                >
-                  <Clapperboard className="h-4 w-4" />
-                  Video
-                </Link>
+                {confirmDeleteId === channel.id ? (
+                  <div className="flex items-center gap-1.5">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setConfirmDeleteId(null)}
+                      disabled={deletingId === channel.id}
+                    >
+                      Cancel
+                    </Button>
+                    <Button
+                      variant="destructive"
+                      size="sm"
+                      onClick={() => void deleteChannel(channel.id)}
+                      disabled={deletingId === channel.id}
+                    >
+                      {deletingId === channel.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                      Delete
+                    </Button>
+                  </div>
+                ) : (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setConfirmDeleteId(channel.id)}
+                    className="text-muted-foreground hover:text-destructive"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                    Delete
+                  </Button>
+                )}
               </div>
             );
           })}

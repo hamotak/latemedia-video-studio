@@ -3,10 +3,10 @@ import { createPromptPreset, updatePromptPreset } from "@/lib/video-engine/promp
 import { ensureInit } from "@/lib/video-engine/init";
 
 /**
- * Bridges the unified Supabase "channel" to the video engine's local
- * production profile (`prompt_presets`). Each Studio channel gets exactly
- * one engine preset, linked by `studio_channel_id`, so the Video studio can
- * render for the active channel without a separate profile picker.
+ * Bridges the Studio channel to the video engine's local production profile
+ * (`prompt_presets`). Each channel gets exactly one engine preset, linked by
+ * `studio_channel_id`, so the Video studio can render for the active channel
+ * without a separate profile picker.
  */
 
 let columnReady = false;
@@ -16,6 +16,9 @@ function ensureStudioColumn() {
   if (!cols.some((c) => c.name === "studio_channel_id")) {
     db.prepare("ALTER TABLE prompt_presets ADD COLUMN studio_channel_id INTEGER").run();
   }
+  db.prepare(
+    "UPDATE prompt_presets SET voice_provider = ? WHERE voice_provider IS NULL OR lower(trim(voice_provider)) <> ?"
+  ).run(VOICE_PROVIDER, VOICE_PROVIDER);
   columnReady = true;
 }
 
@@ -28,8 +31,14 @@ export type ChannelForPreset = {
   video_style?: unknown;
   voice_id: string | null;
   voice_provider: string | null;
+  voice_speed?: number | null;
+  voice_stability?: number | null;
+  voice_similarity_boost?: number | null;
+  voice_style?: number | null;
   stock_folder: string | null;
 };
+
+const VOICE_PROVIDER = "elevenlabs";
 
 function optionalText(value: unknown): string | null {
   if (typeof value !== "string") return null;
@@ -76,7 +85,11 @@ export function ensurePresetForChannel(channel: ChannelForPreset): number {
     description: channel.description,
     video_style: optionalText(channel.video_style),
     voice_id: channel.voice_id,
-    voice_provider: channel.voice_provider,
+    voice_provider: VOICE_PROVIDER,
+    voice_speed: channel.voice_speed ?? null,
+    voice_stability: channel.voice_stability ?? null,
+    voice_similarity_boost: channel.voice_similarity_boost ?? null,
+    voice_style: channel.voice_style ?? null,
     stock_folder: channel.stock_folder,
   });
   db.prepare("UPDATE prompt_presets SET studio_channel_id = ? WHERE id = ?").run(channel.id, id);
@@ -100,8 +113,18 @@ export function syncPresetForChannel(channel: ChannelForPreset): number {
     description: channel.description,
     video_style: optionalText(channel.video_style),
     voice_id: channel.voice_id,
-    voice_provider: channel.voice_provider,
+    voice_provider: VOICE_PROVIDER,
+    voice_speed: channel.voice_speed ?? null,
+    voice_stability: channel.voice_stability ?? null,
+    voice_similarity_boost: channel.voice_similarity_boost ?? null,
+    voice_style: channel.voice_style ?? null,
     stock_folder: channel.stock_folder,
   });
   return id;
+}
+
+export function deletePresetForChannel(channelId: number): void {
+  ensureInit();
+  ensureStudioColumn();
+  db.prepare("DELETE FROM prompt_presets WHERE studio_channel_id = ?").run(channelId);
 }

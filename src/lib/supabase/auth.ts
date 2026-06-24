@@ -21,20 +21,15 @@ function safeUserMetadata(metadata: Record<string, unknown> | null | undefined):
 /**
  * Resolve the signed-in user for an API route.
  *
- * Fast path: `auth.getClaims()` verifies the request's JWT LOCALLY using the
- * project's asymmetric signing keys (ES256) — no network round-trip. This
- * replaces `auth.getUser()`, which validates against the Supabase auth server
- * on every call and was being invoked on ~44 routes (a major source of the
- * "app feels slow" complaint).
- *
- * Safety: if local verification is unavailable for any reason, we fall back to
- * the network-validated `getUser()` — so behavior is never worse than before.
+ * Standalone build: `createClient()` returns the local single-admin stub, so
+ * both claims and user fallback reads are in-memory and never touch the
+ * network.
  */
 export async function getAuthedUser(): Promise<AuthedUser | null> {
-  const supabase = await createClient();
+  const client = await createClient();
 
   try {
-    const { data, error } = await supabase.auth.getClaims();
+    const { data, error } = await client.auth.getClaims();
     const claims = data?.claims as Record<string, unknown> | undefined;
     const sub = claims?.sub;
     if (!error && typeof sub === "string" && sub.length > 0) {
@@ -46,12 +41,12 @@ export async function getAuthedUser(): Promise<AuthedUser | null> {
       };
     }
   } catch {
-    // fall through to the network-validated path
+    // fall through to the local user path
   }
 
   const {
     data: { user },
-  } = await supabase.auth.getUser();
+  } = await client.auth.getUser();
   if (!user) return null;
   return {
     id: user.id,

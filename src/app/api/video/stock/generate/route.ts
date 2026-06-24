@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { getSetting } from "@/lib/video-engine/settings";
 import { channelStockTheme } from "@/lib/video-engine/channel-stock";
-import { getConnectionStatus } from "@/lib/video-engine/services/gdrive";
 import {
   cancelStockGeneration,
   getStockGenStatus,
@@ -80,18 +79,6 @@ async function preflightStockGeneration(opts: {
   exactPromptCount: number;
   requestedCount: number;
 }): Promise<NextResponse | null> {
-  const drive = await getConnectionStatus();
-  if (!drive.connected) {
-    return stockJson(
-      {
-        error: drive.error || "Connect Google Drive before generating B-roll.",
-        errorKind: "drive_required",
-        connectedEmail: drive.email ?? null,
-      },
-      { status: 400 }
-    );
-  }
-
   if (process.env.STOCK_GEN_MOCK === "1") return null;
 
   const labsKey = getSetting("LABS69_API_KEY").trim();

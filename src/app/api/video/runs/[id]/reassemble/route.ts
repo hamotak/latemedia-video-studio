@@ -1,7 +1,12 @@
 import { NextResponse } from "next/server";
 import db from "@/lib/video-engine/db";
 import { ensureInit } from "@/lib/video-engine/init";
-import { startResumeRun, canResumeRun, retiredVideoModeError } from "@/lib/video-engine/pipeline";
+import {
+  checkVideoWorkerBootstrap,
+  startResumeRun,
+  canResumeRun,
+  retiredVideoModeError,
+} from "@/lib/video-engine/pipeline";
 import { runPreflight } from "@/lib/video-engine/preflight";
 import { requireVideoRunAccess } from "@/lib/video-access";
 import { loadAppSettingsIntoCache } from "@/lib/app-settings-store";
@@ -146,6 +151,18 @@ export async function POST(_: Request, ctx: { params: Promise<{ id: string }> })
   const invalidVoice = await resumeVoiceValidationError(id);
   if (invalidVoice) {
     return NextResponse.json({ error: invalidVoice, errorKind: "voice_invalid" }, { status: 400 });
+  }
+
+  const workerReady = checkVideoWorkerBootstrap();
+  if (!workerReady.ok) {
+    return NextResponse.json(
+      {
+        error: "Video generation worker could not start. Fix the local worker error before resuming this run.",
+        errorKind: "worker_bootstrap_failed",
+        detail: workerReady.error,
+      },
+      { status: 500 }
+    );
   }
 
   const worker = startResumeRun(id);

@@ -20,6 +20,7 @@ import { cn } from "@/lib/utils";
 import { createClient } from "@/lib/supabase/client";
 import { useActiveChannel, type ChannelFeatures } from "@/lib/active-channel-context";
 import { STUDIO_SIDEBAR_TOGGLE_EVENT } from "@/lib/studio-sidebar-offset";
+import { currentSettingsReturnPath, rememberSettingsReturn } from "@/lib/settings-return";
 
 const SIDEBAR_PREF_KEY = "sidebar-collapsed";
 
@@ -42,15 +43,8 @@ type NavSection = {
  * current routes until the IA rename flips them (with redirects). */
 const ADMIN_SECTIONS: NavSection[] = [
   {
-    label: "STUDIO",
     items: [
       { href: "/studio/video", label: "Video", icon: Clapperboard },
-    ],
-  },
-  {
-    label: "CHANNEL",
-    separatorAbove: true,
-    items: [
       { href: "/admin/channels",       label: "Channels", icon: Tv2      },
       { href: "/admin/settings/video", label: "Settings", icon: Settings },
     ],
@@ -280,6 +274,9 @@ export function Sidebar() {
                     <li key={item.href}>
                       <Link
                         href={item.href}
+                        onClick={() => {
+                          if (item.href === "/admin/settings/video") rememberSettingsReturn(currentSettingsReturnPath());
+                        }}
                         title={!showLabels ? item.label : undefined}
                         className={cn(
                           // Same padding in both states so the icon never shifts

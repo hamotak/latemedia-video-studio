@@ -7,7 +7,7 @@ import { DATA_ENV, LEGACY_DATA_ENV } from "./app-meta";
  * Standalone build: keep all local data inside the project's own `data/`
  * folder. This makes the app fully self-contained (copy or delete the folder
  * to move/uninstall) and guarantees it never shares state with any other
- * Late Media install on the same machine. An explicit data-dir env var still
+ * Bilal Demo install on the same machine. An explicit data-dir env var still
  * wins for advanced setups.
  */
 function findProjectRoot(...startDirs: string[]): string {
@@ -32,6 +32,9 @@ export function resolveDataDir(): string {
 
   const legacyExplicit = process.env[LEGACY_DATA_ENV]?.trim();
   if (legacyExplicit) return legacyExplicit;
+
+  const oldLegacyExplicit = process.env.CONVEYER_HUM_DATA_DIR?.trim();
+  if (oldLegacyExplicit) return oldLegacyExplicit;
 
   return DEFAULT_DATA_DIR;
 }

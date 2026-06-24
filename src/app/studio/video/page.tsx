@@ -7,7 +7,6 @@ import {
   CheckCircle2,
   Clapperboard,
   Clock3,
-  ExternalLink,
   Film,
   FileText,
   FolderCheck,
@@ -15,18 +14,16 @@ import {
   Loader2,
   Lock,
   Music2,
-  Settings,
   Tv2,
   Play,
   RefreshCw,
   RotateCcw,
   Square,
-  UploadCloud,
   Trash2,
   type LucideIcon,
 } from "lucide-react";
 import { useActiveChannel } from "@/lib/active-channel-context";
-import { Button, buttonVariants } from "@/components/ui/button";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { PageContainer } from "@/components/ui/page-container";
@@ -55,7 +52,7 @@ type Run = {
 };
 
 const MODES = [
-  { value: "hybrid", label: "Hybrid", description: "Fresh opening, Drive B-roll tail.", icon: FolderCheck },
+  { value: "hybrid", label: "Hybrid", description: "Fresh opening, local B-roll tail.", icon: FolderCheck },
   { value: "image", label: "Image cut", description: "Fresh intro, generated image-card tail.", icon: ImageIcon },
 ] as const satisfies readonly {
   value: "hybrid" | "image";
@@ -90,6 +87,40 @@ function videoStudioRoute(runId?: string | null) {
 function replaceVideoRoute(runId?: string | null) {
   if (typeof window === "undefined") return;
   window.history.replaceState(null, "", videoStudioRoute(runId));
+}
+
+const LAST_RUN_KEY_PREFIX = "bilal-demo-video:last-run:v1:";
+
+function lastRunKey(channelId: number) {
+  return `${LAST_RUN_KEY_PREFIX}${channelId}`;
+}
+
+function readLastRun(channelId: number): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const value = window.localStorage.getItem(lastRunKey(channelId))?.trim();
+    return value || null;
+  } catch {
+    return null;
+  }
+}
+
+function rememberLastRun(channelId: number, runId: string) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(lastRunKey(channelId), runId);
+  } catch {
+    /* localStorage may be disabled */
+  }
+}
+
+function clearLastRun(channelId: number) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(lastRunKey(channelId));
+  } catch {
+    /* localStorage may be disabled */
+  }
 }
 
 const RUN_STATUS_COLOR: Record<string, string> = {
@@ -199,11 +230,13 @@ function VideoStudio({ channelId }: { channelId: number }) {
   const [error, setError] = useState("");
   const [historyOpen, setHistoryOpen] = useState(false);
 
-  const selectRun = useCallback((id: string | null) => {
+  const selectRun = useCallback((id: string | null, options: { clearMemory?: boolean } = {}) => {
     setOpenRunId(id);
     setError("");
+    if (id) rememberLastRun(channelId, id);
+    else if (options.clearMemory) clearLastRun(channelId);
     replaceVideoRoute(id);
-  }, []);
+  }, [channelId]);
 
   const updateScript = useCallback((value: string) => {
     setScript(value);
@@ -261,12 +294,24 @@ function VideoStudio({ channelId }: { channelId: number }) {
     if (typeof window === "undefined") return;
     const syncFromUrl = () => {
       const id = new URLSearchParams(window.location.search).get("runId");
-      setOpenRunId(id && id.trim() ? id : null);
+      const clean = id?.trim();
+      if (clean) {
+        rememberLastRun(channelId, clean);
+        setOpenRunId(clean);
+        return;
+      }
+      const remembered = readLastRun(channelId);
+      if (remembered) {
+        setOpenRunId(remembered);
+        replaceVideoRoute(remembered);
+        return;
+      }
+      setOpenRunId(null);
     };
     syncFromUrl();
     window.addEventListener("popstate", syncFromUrl);
     return () => window.removeEventListener("popstate", syncFromUrl);
-  }, []);
+  }, [channelId]);
 
   useEffect(() => {
     if (profileLoading) return;
@@ -326,7 +371,7 @@ function VideoStudio({ channelId }: { channelId: number }) {
         actions={
           <div className="flex max-w-[860px] flex-wrap items-center justify-end gap-2">
             {openRunId && (
-              <Button type="button" variant="outline" size="sm" onClick={() => selectRun(null)} className="h-8 gap-1.5">
+              <Button type="button" variant="outline" size="sm" onClick={() => selectRun(null, { clearMemory: true })} className="h-8 gap-1.5">
                 <Clapperboard className="h-3.5 w-3.5" />
                 New video
               </Button>
@@ -342,9 +387,9 @@ function VideoStudio({ channelId }: { channelId: number }) {
         {openRunId ? (
           <VideoRunDetailPage
             runId={openRunId}
-            onBackToNew={() => selectRun(null)}
+            onBackToNew={() => selectRun(null, { clearMemory: true })}
             onRunChanged={() => void loadRuns(profile?.presetId ?? null)}
-            onDeleted={() => { selectRun(null); void loadRuns(profile?.presetId ?? null); }}
+            onDeleted={() => { selectRun(null, { clearMemory: true }); void loadRuns(profile?.presetId ?? null); }}
           />
         ) : (
           <VideoComposer
@@ -531,10 +576,6 @@ function VideoHeaderActions({
         <RefreshCw className="h-3.5 w-3.5" />
         Refresh
       </Button>
-      <Link href="/admin/settings/video" className={buttonVariants({ variant: "outline", size: "sm" })}>
-        <Settings className="h-3.5 w-3.5" />
-        Settings
-      </Link>
     </div>
   );
 }
@@ -825,7 +866,7 @@ function VideoRunDetailPage({
   const [detailError, setDetailError] = useState("");
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const [actionBusy, setActionBusy] = useState<"sync" | "cancel" | "resume" | null>(null);
+  const [actionBusy, setActionBusy] = useState<"cancel" | "resume" | null>(null);
 
   async function parseMutationError(res: Response, fallback: string) {
     const data = (await res.json().catch(() => null)) as { error?: string } | null;
@@ -901,24 +942,6 @@ function VideoRunDetailPage({
       setDetailError("Could not reach the video backend. Check that the local app server is still running.");
     } finally {
       setDeleting(false);
-    }
-  };
-
-  const syncDrive = async () => {
-    setActionBusy("sync");
-    setDetailError("");
-    try {
-      const res = await fetch(`/api/video/runs/${runId}/drive`, { method: "POST" });
-      if (!res.ok) {
-        setDetailError(await parseMutationError(res, "Drive sync failed."));
-        return;
-      }
-      await load();
-      onRunChanged();
-    } catch {
-      setDetailError("Could not reach the video backend. Check that the local app server is still running.");
-    } finally {
-      setActionBusy(null);
     }
   };
 
@@ -1007,12 +1030,6 @@ function VideoRunDetailPage({
                 Resume
               </Button>
             )}
-            {run?.output_path && (
-              <Button variant="outline" size="sm" className="h-8 text-xs" onClick={syncDrive} disabled={actionBusy != null}>
-                {actionBusy === "sync" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <UploadCloud className="h-3.5 w-3.5" />}
-                Sync
-              </Button>
-            )}
             <Button variant="outline" size="sm" className="h-8 text-xs" onClick={load}>
               <RefreshCw className="h-3.5 w-3.5" />
               Refresh
@@ -1033,9 +1050,6 @@ function VideoRunDetailPage({
             <>
               <RunPreview runId={runId} run={run} assets={assets} />
               {assets && <RunAssetSections runId={runId} assets={assets} />}
-              {run && (run.finalVideoLink || run.clipsFolderLink || run.driveStatus?.synced) && (
-                <DriveLinks run={run} mode={assets?.mode} />
-              )}
               <RunDiagnostics logs={logs} />
             </>
           )}
@@ -1266,30 +1280,6 @@ function SceneStageIcon({ stage }: { stage: SceneStage }) {
   if (stage === "image") return <ImageIcon className="h-6 w-6 text-muted-foreground/50" />;
   if (stage === "video" || stage === "rendered") return <Film className="h-6 w-6 text-muted-foreground/50" />;
   return <Loader2 className="h-6 w-6 animate-spin text-muted-foreground/50" />;
-}
-
-function DriveLinks({ run, mode }: { run: RunFull; mode?: string }) {
-  const clipsFolderLink = mode === "stock" ? null : run.clipsFolderLink ?? null;
-
-  return (
-    <div className="flex flex-wrap gap-2 rounded-md border border-border bg-background px-3 py-2 text-xs">
-      {run.finalVideoLink && (
-        <a href={run.finalVideoLink} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 font-medium text-primary hover:underline">
-          <ExternalLink className="h-3.5 w-3.5" />
-          Final
-        </a>
-      )}
-      {clipsFolderLink && (
-        <a href={clipsFolderLink} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 font-medium text-primary hover:underline">
-          <FolderCheck className="h-3.5 w-3.5" />
-          Folder
-        </a>
-      )}
-      {run.driveStatus?.syncedAt && (
-        <span className="text-muted-foreground">Synced {formatRunTime(run.driveStatus.syncedAt)}</span>
-      )}
-    </div>
-  );
 }
 
 function RunDiagnostics({ logs }: { logs: LogEntry[] }) {

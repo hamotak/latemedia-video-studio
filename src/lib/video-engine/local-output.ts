@@ -11,13 +11,23 @@ import type { StockClip } from "./services/stock-library";
  * folder on the user's Desktop instead of Google Drive, so everything is
  * offline and easy to find. Override the root with the LOCAL_LIBRARY_DIR env var.
  *
- *   ~/Desktop/Late Media Videos/<Channel>/Final Videos/<title>.mp4
+ *   ~/Desktop/Bilal Demo Videos/<Channel>/Final Videos/<title>.mp4
  */
 export function localLibraryRoot(): string {
   const configured = process.env.LOCAL_LIBRARY_DIR?.trim();
   return configured && configured.length > 0
     ? configured
-    : path.join(os.homedir(), "Desktop", "Late Media Videos");
+    : path.join(os.homedir(), "Desktop", "Bilal Demo Videos");
+}
+
+function legacyLocalLibraryRoot(): string {
+  return path.join(os.homedir(), "Desktop", "Late Media Videos");
+}
+
+function localLibraryReadRoots(): string[] {
+  const primary = path.resolve(localLibraryRoot());
+  const legacy = path.resolve(legacyLocalLibraryRoot());
+  return primary === legacy ? [primary] : [primary, legacy];
 }
 
 function sanitize(name: string): string {
@@ -36,6 +46,12 @@ export function channelBRollsDir(channelName: string): string {
   const dir = path.join(localLibraryRoot(), sanitize(channelName), "B-Rolls");
   fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+function channelBRollsReadDirs(channelName: string): string[] {
+  const safeChannel = sanitize(channelName);
+  const dirs = localLibraryReadRoots().map((root) => path.join(root, safeChannel, "B-Rolls"));
+  return Array.from(new Set(dirs.map((dir) => path.resolve(dir))));
 }
 
 const getRunRow = db.prepare(
@@ -82,12 +98,17 @@ export function copyRunToDesktop(runId: string, finalPath: string, runDir: strin
 /* ════════════════════════════════════════════════
    LOCAL B-ROLL LIBRARY  (replaces Google Drive)
    Clips live as plain .mp4 files under
-   ~/Desktop/Late Media Videos/<Channel>/B-Rolls/.
+   ~/Desktop/Bilal Demo Videos/<Channel>/B-Rolls/.
    A clip id is `local:<base64url of absolute path>`, validated to be
    inside the library root so it can be served/deleted safely.
 ════════════════════════════════════════════════ */
 const BROLL_ID_PREFIX = "local:";
 const VIDEO_EXT = /\.(mp4|mov|webm|m4v)$/i;
+
+export interface LocalBRollClipRow {
+  clip: StockClip;
+  localPath: string;
+}
 
 export function bRollClipId(absPath: string): string {
   return BROLL_ID_PREFIX + Buffer.from(path.resolve(absPath), "utf-8").toString("base64url");
@@ -106,24 +127,29 @@ export function resolveBRollClipPath(id: string): string | null {
   } catch {
     return null;
   }
-  const root = path.resolve(localLibraryRoot());
   const full = path.resolve(abs);
-  if (full !== root && !full.startsWith(root + path.sep)) return null;
+  const insideLibrary = localLibraryReadRoots().some((root) => full === root || full.startsWith(root + path.sep));
+  if (!insideLibrary) return null;
   return fs.existsSync(full) ? full : null;
 }
 
-/** List a channel's B-Roll clips from disk as `StockClip`s (source "local"). */
-export function listBRollClips(channelName: string): StockClip[] {
-  const dir = channelBRollsDir(channelName);
-  let files: string[];
-  try {
-    files = fs.readdirSync(dir);
-  } catch {
-    return [];
-  }
-  return files
-    .filter((f) => VIDEO_EXT.test(f))
-    .map((f) => {
+/** List a channel's B-Roll clips from disk with their resolved paths. */
+export function listBRollClipRows(channelName: string): LocalBRollClipRow[] {
+  channelBRollsDir(channelName);
+  const seenNames = new Set<string>();
+  const rows: LocalBRollClipRow[] = [];
+  for (const dir of channelBRollsReadDirs(channelName)) {
+    let files: string[];
+    try {
+      files = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const f of files) {
+      if (!VIDEO_EXT.test(f)) continue;
+      const dedupeKey = f.toLowerCase();
+      if (seenNames.has(dedupeKey)) continue;
+      seenNames.add(dedupeKey);
       const full = path.join(dir, f);
       let mtime: string | null = null;
       try {
@@ -131,17 +157,26 @@ export function listBRollClips(channelName: string): StockClip[] {
       } catch {
         /* ignore */
       }
-      return {
-        driveFileId: bRollClipId(full),
-        name: f,
-        displayName: f.replace(VIDEO_EXT, ""),
-        source: "local" as const,
-        createdTime: mtime,
-        modifiedTime: mtime,
-        driveFileLink: null,
-      } satisfies StockClip;
-    })
-    .sort((a, b) => (b.modifiedTime ?? "").localeCompare(a.modifiedTime ?? ""));
+      rows.push({
+        clip: {
+          driveFileId: bRollClipId(full),
+          name: f,
+          displayName: f.replace(VIDEO_EXT, ""),
+          source: "local" as const,
+          createdTime: mtime,
+          modifiedTime: mtime,
+          driveFileLink: null,
+        } satisfies StockClip,
+        localPath: full,
+      } satisfies LocalBRollClipRow);
+    }
+  }
+  return rows.sort((a, b) => (b.clip.modifiedTime ?? "").localeCompare(a.clip.modifiedTime ?? ""));
+}
+
+/** List a channel's B-Roll clips from disk as `StockClip`s (source "local"). */
+export function listBRollClips(channelName: string): StockClip[] {
+  return listBRollClipRows(channelName).map((row) => row.clip);
 }
 
 /** Copy a clip into a channel's B-Roll folder; returns its clip id. */

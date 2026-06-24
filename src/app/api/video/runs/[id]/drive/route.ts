@@ -157,12 +157,7 @@ export async function POST(_req: Request, ctx: { params: Promise<{ id: string }>
       { status: 500 }
     );
   }
-  try {
-    await mirrorVideoRun(id);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return NextResponse.json({ error: `Drive metadata was saved locally but not mirrored to Supabase: ${msg}` }, { status: 500 });
-  }
+  await mirrorVideoRun(id);
   return NextResponse.json({
     ok: true,
     syncedAt: updated.drive_synced_at,

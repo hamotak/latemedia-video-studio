@@ -1,8 +1,3 @@
-import { google, drive_v3 } from "googleapis";
-// Derive the client type from googleapis itself so it matches the instance
-// returned by `new google.auth.OAuth2(...)` and avoids a duplicate
-// google-auth-library version clash.
-type OAuth2Client = InstanceType<typeof google.auth.OAuth2>;
 import fs from "node:fs";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -10,30 +5,29 @@ import { getSetting, setSetting } from "../settings";
 import { DRIVE_ROOT_FOLDER } from "../app-meta";
 import { GDRIVE_CALLBACK_PATH, oauthRedirectUri } from "./gdrive-redirect";
 
-const SCOPES = [
-  "https://www.googleapis.com/auth/drive.file",       // only files we create/open
-  "https://www.googleapis.com/auth/userinfo.email",   // to identify connected account
-];
+const DRIVE_DISABLED_MESSAGE = "Google Drive is disabled in this local-only build.";
 
-// Fallback only — used by refresh-token API calls, where redirect_uri is never
-// sent to Google. The interactive OAuth dance ALWAYS passes an explicit URI
-// derived from the live request (see oauthRedirectUri), so the redirect matches
-// the port Next.js actually bound (which may be 3001/3002 if 3000 was busy).
-const DEFAULT_REDIRECT_URI = `http://localhost:3000${GDRIVE_CALLBACK_PATH}`;
+type DriveClient = {
+  files: {
+    list(args: Record<string, unknown>): Promise<{
+      data: { files?: Array<Record<string, any>>; nextPageToken?: string | null };
+    }>;
+    create(args: Record<string, unknown>): Promise<{ data: Record<string, any> }>;
+    get(args: Record<string, unknown>, options?: Record<string, unknown>): Promise<{ data: any }>;
+    update(args: Record<string, unknown>): Promise<{ data: Record<string, any> }>;
+  };
+  permissions: {
+    create(args: Record<string, unknown>): Promise<{ data: Record<string, any> }>;
+  };
+};
 
 // Re-export so route handlers keep importing the redirect helper from here.
 export { oauthRedirectUri, GDRIVE_CALLBACK_PATH };
 
 /** Build a fresh OAuth2 client, optionally with refresh_token loaded. */
-export function getOAuth2Client(redirectUri: string = DEFAULT_REDIRECT_URI): OAuth2Client | null {
-  const clientId = getSetting("GDRIVE_CLIENT_ID");
-  const clientSecret = getSetting("GDRIVE_CLIENT_SECRET");
-  if (!clientId || !clientSecret) return null;
-
-  const client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
-  const refresh = getSetting("GDRIVE_REFRESH_TOKEN");
-  if (refresh) client.setCredentials({ refresh_token: refresh });
-  return client;
+export function getOAuth2Client(redirectUri?: string): null {
+  void redirectUri;
+  return null;
 }
 
 /**
@@ -41,16 +35,9 @@ export function getOAuth2Client(redirectUri: string = DEFAULT_REDIRECT_URI): OAu
  * same value passed to exchangeCodeForTokens — Google rejects a mismatch.
  */
 export function buildAuthUrl(redirectUri: string, state?: string): string {
-  const oauth = getOAuth2Client(redirectUri);
-  if (!oauth) {
-    throw new Error("Set GDRIVE_CLIENT_ID and GDRIVE_CLIENT_SECRET in /settings first");
-  }
-  return oauth.generateAuthUrl({
-    access_type: "offline",   // gets us a refresh_token
-    prompt: "consent",        // forces refresh_token even on repeat connect
-    scope: SCOPES,
-    ...(state ? { state } : {}),
-  });
+  void redirectUri;
+  void state;
+  throw new Error(DRIVE_DISABLED_MESSAGE);
 }
 
 /**
@@ -58,34 +45,17 @@ export function buildAuthUrl(redirectUri: string, state?: string): string {
  * `redirectUri` must match the one used in buildAuthUrl for the same flow.
  */
 export async function exchangeCodeForTokens(code: string, redirectUri: string): Promise<{ email: string }> {
-  const oauth = getOAuth2Client(redirectUri);
-  if (!oauth) throw new Error("OAuth client not configured");
-
-  const { tokens } = await oauth.getToken(code);
-  if (!tokens.refresh_token) {
-    throw new Error(
-      "Google did not return a refresh_token. Revoke prior access at https://myaccount.google.com/permissions and reconnect."
-    );
-  }
-  oauth.setCredentials(tokens);
-
-  const oauth2api = google.oauth2({ version: "v2", auth: oauth });
-  const userinfo = await oauth2api.userinfo.get();
-  const email = userinfo.data.email ?? "";
-
-  setSetting("GDRIVE_REFRESH_TOKEN", tokens.refresh_token);
-  setSetting("GDRIVE_CONNECTED_EMAIL", email);
-  return { email };
+  void code;
+  void redirectUri;
+  throw new Error(DRIVE_DISABLED_MESSAGE);
 }
 
 /** Authenticated Drive client; null if creds/token missing. */
-export function getDriveClient(): drive_v3.Drive | null {
-  const oauth = getOAuth2Client();
-  if (!oauth || !getSetting("GDRIVE_REFRESH_TOKEN")) return null;
-  return google.drive({ version: "v3", auth: oauth });
+export function getDriveClient(): DriveClient | null {
+  return null;
 }
 
-/** Categorizes Drive errors so the UI can show targeted instructions. */
+/** Categorizes legacy Drive errors so compatibility responses stay typed. */
 export type ConnectionErrorKind =
   | "api_not_enabled"   // Drive API not enabled in the user's Google Cloud project
   | "auth_invalid"       // refresh_token revoked, expired, or no longer valid
@@ -107,63 +77,9 @@ export interface ConnectionStatus {
   credentialsConfigured: boolean;
 }
 
-/** Parse the verbose Google API error string into a categorized hint. */
-function classifyError(msg: string): { kind: ConnectionErrorKind; enableUrl?: string } {
-  if (
-    msg.includes("accessNotConfigured") ||
-    msg.includes("has not been used in project") ||
-    msg.includes("is disabled. Enable it")
-  ) {
-    // Pull the Enable URL out of the error if present.
-    const m = msg.match(/https:\/\/console\.developers\.google\.com\/[^\s)]+/);
-    return { kind: "api_not_enabled", enableUrl: m ? m[0] : undefined };
-  }
-  if (
-    msg.includes("invalid_grant") ||
-    msg.includes("Token has been expired") ||
-    msg.includes("revoked") ||
-    msg.includes("invalid_client") ||
-    msg.includes("unauthorized")
-  ) {
-    return { kind: "auth_invalid" };
-  }
-  if (
-    msg.includes("ENOTFOUND") ||
-    msg.includes("ETIMEDOUT") ||
-    msg.includes("ECONNRESET") ||
-    msg.includes("network")
-  ) {
-    return { kind: "network" };
-  }
-  return { kind: "other" };
-}
-
 /** Live check: do we have a working connection right now? */
 export async function getConnectionStatus(): Promise<ConnectionStatus> {
-  const credentialsConfigured =
-    !!getSetting("GDRIVE_CLIENT_ID") && !!getSetting("GDRIVE_CLIENT_SECRET");
-  const syncEnabled = getSetting("GDRIVE_SYNC_ENABLED") === "1";
-  const email = getSetting("GDRIVE_CONNECTED_EMAIL");
-
-  const drive = getDriveClient();
-  if (!drive) return { connected: false, credentialsConfigured, syncEnabled };
-
-  try {
-    await drive.about.get({ fields: "user(emailAddress)" });
-    return { connected: true, email: email || undefined, credentialsConfigured, syncEnabled };
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    const { kind, enableUrl } = classifyError(msg);
-    return {
-      connected: false,
-      email: email || undefined,
-      error: msg,
-      errorKind: kind,
-      enableUrl,
-      credentialsConfigured,
-      syncEnabled,
-    };
-  }
+  return { connected: false, credentialsConfigured: false, syncEnabled: false };
 }
 
 /** Clears refresh_token + email (does NOT clear client_id/secret). */

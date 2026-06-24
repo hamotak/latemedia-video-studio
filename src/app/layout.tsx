@@ -5,8 +5,8 @@ import { ThemeProvider } from "@/lib/theme-provider";
 import { ShellWrapper } from "@/components/shell-wrapper";
 
 export const metadata: Metadata = {
-  title: "Late Media App",
-  description: "Ideation, competitor research, channel context, and thumbnail generation for Late Media.",
+  title: "Bilal Demo Video Generation",
+  description: "Local video generation for Bilal Demo.",
 };
 
 export default function RootLayout({

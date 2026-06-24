@@ -7,15 +7,13 @@ import { pLimit } from "../plimit";
 import type { Scene } from "./scene-split";
 import { generateImage } from "./image-gen";
 import { animateScene } from "./img2vid";
-import { uploadFile, uploadString } from "./gdrive";
 import { saveBRollClip } from "../local-output";
-import { driveFileLink, ensureChannelStockBrollFolder, ensureStockCollectionFolder } from "./drive-workspace";
 import { cancelJob } from "./labs69";
 
 /**
- * "Generate Stocks" - build general B-roll clips for a channel and upload them
- * into that channel's Drive stock folder. Pipeline per clip: text -> image ->
- * image-to-video -> Drive upload, matching the main generator.
+ * "Generate Stocks" - build general B-roll clips for a channel and save them
+ * into that channel's local Desktop B-roll folder. Pipeline per clip:
+ * text -> image -> image-to-video -> local save, matching the main generator.
  */
 
 export interface StockGenClipStep {
@@ -91,7 +89,6 @@ const statusByJob = new Map<string, StockGenStatus>();
 const promptAborters = new Map<string, AbortController>();
 const JOBS_DIR = path.join(DATA_DIR, "stock-gen-jobs");
 const DEFAULT_PROMPT_TIMEOUT_MS = 45_000;
-const DRIVE_PRECHECK_TIMEOUT_MS = 15_000;
 
 function createJobId(folder: string): string {
   const safeFolder = safeFilePart(folder) || "clips";
@@ -150,8 +147,8 @@ function remember(status: StockGenStatus): StockGenStatus {
   return status;
 }
 
-async function uploadStockGenerationManifest(status: StockGenStatus, metadataFolderId?: string): Promise<void> {
-  if (!metadataFolderId || status.manifestDriveFileId) return;
+async function persistStockGenerationManifest(status: StockGenStatus): Promise<void> {
+  if (status.manifestDriveFileId) return;
   const manifest = {
     kind: "stock-generation",
     jobId: status.jobId,
@@ -179,16 +176,13 @@ async function uploadStockGenerationManifest(status: StockGenStatus, metadataFol
       status: clip.status,
       driveFileId: clip.driveFileId ?? null,
       driveName: clip.driveName ?? null,
-      driveFileLink: clip.driveFileLink ?? (clip.driveFileId ? driveFileLink(clip.driveFileId) : null),
+      driveFileLink: clip.driveFileLink ?? null,
     })),
   };
-  const manifestId = await uploadString(
-    JSON.stringify(manifest, null, 2),
-    metadataFolderId,
-    `stock-generation-${safeFilePart(status.jobId)}.json`,
-    "application/json"
-  );
-  status.manifestDriveFileId = manifestId;
+  fs.mkdirSync(JOBS_DIR, { recursive: true });
+  const manifestPath = path.join(JOBS_DIR, `stock-generation-${safeFilePart(status.jobId)}.json`);
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+  status.manifestDriveFileId = `local:${path.basename(manifestPath)}`;
 }
 
 function loadJob(jobId: string): StockGenStatus | null {
@@ -499,18 +493,6 @@ async function expandStockPrompts(theme: string, count: number, jobId: string, s
   }
 }
 
-async function resolveDriveStockFolder(
-  folder: string,
-  channelName?: string | null
-): Promise<{ id: string; link: string; metadataFolderId?: string }> {
-  if (channelName?.trim()) {
-    const info = await ensureChannelStockBrollFolder(channelName);
-    return { id: info.id, link: info.link, metadataFolderId: info.workspace.metadataFolderId };
-  }
-  const info = await ensureStockCollectionFolder(channelName || folder, folder);
-  return { id: info.id, link: info.link };
-}
-
 /**
  * Start a background batch. Returns immediately; poll getStockGenStatus(jobId).
  * `videoStyle` (optional) is appended to each prompt for the channel's look.
@@ -569,13 +551,8 @@ export function startStockGeneration(opts: {
   void (async () => {
     try {
       log(runId, "info", `Generate Stocks: preparing ${count} clips for "${folder}"`, { stage: "image" });
-      const driveFolder = await withTimeout(
-        "Drive folder check",
-        resolveDriveStockFolder(folder, opts.channelName),
-        DRIVE_PRECHECK_TIMEOUT_MS
-      );
-      status.driveFolderId = driveFolder.id;
-      status.driveFolderLink = driveFolder.link;
+      status.driveFolderId = undefined;
+      status.driveFolderLink = undefined;
       remember(status);
 
       status.promptStartedAt = Date.now();
@@ -645,9 +622,9 @@ export function startStockGeneration(opts: {
         }
         status.phase = "finished";
         status.finishedAt = Date.now();
-        await uploadStockGenerationManifest(status, driveFolder.metadataFolderId).catch((e) => {
+        await persistStockGenerationManifest(status).catch((e) => {
           const msg = e instanceof Error ? e.message.slice(0, 160) : String(e);
-          status.lastError = status.lastError || `Manifest upload failed: ${msg}`;
+          status.lastError = status.lastError || `Manifest save failed: ${msg}`;
         });
         remember(status);
         return;
@@ -797,12 +774,12 @@ export function startStockGeneration(opts: {
 
       status.phase = status.cancelRequested ? "cancelled" : status.failed >= status.total && status.done === 0 ? "failed" : "finished";
       status.finishedAt = Date.now();
-      await uploadStockGenerationManifest(status, driveFolder.metadataFolderId).catch((e) => {
+      await persistStockGenerationManifest(status).catch((e) => {
         const msg = e instanceof Error ? e.message.slice(0, 160) : String(e);
-        status.lastError = status.lastError || `Manifest upload failed: ${msg}`;
+        status.lastError = status.lastError || `Manifest save failed: ${msg}`;
       });
       if (status.cancelRequested) {
-        status.lastError = `Generation stopped after ${status.done}/${status.total} Drive uploads.`;
+        status.lastError = `Generation stopped after ${status.done}/${status.total} local saves.`;
         log(runId, "warn", `Generate Stocks stopped: ${status.done}/${status.total} added to "${folder}" before stop`, { stage: "image" });
       } else {
         log(runId, "success", `Generate Stocks done: ${status.done}/${status.total} added to "${folder}" (${status.failed} failed)`, { stage: "image" });
@@ -855,15 +832,8 @@ export function retryStockGenerationClip(jobId: string, index: number, mode: "im
       if (step.videoJobId && step.videoStatus === "running") await cancelJob("videos", step.videoJobId).catch(() => false);
       if (retryMode === "image" && step.imageJobId && step.imageStatus === "running") await cancelJob("images", step.imageJobId).catch(() => false);
 
-      const driveFolder = status.driveFolderId
-        ? { id: status.driveFolderId, link: status.driveFolderLink || `https://drive.google.com/drive/folders/${status.driveFolderId}` }
-        : await withTimeout(
-            "Drive folder check",
-            resolveDriveStockFolder(status.folder, status.channelName),
-            DRIVE_PRECHECK_TIMEOUT_MS
-          );
-      status.driveFolderId = driveFolder.id;
-      status.driveFolderLink = driveFolder.link;
+      status.driveFolderId = undefined;
+      status.driveFolderLink = undefined;
       const tmpDir = path.join(DATA_DIR, "library-cache", "_gen", status.folder);
       const imageDir = path.join(tmpDir, "images");
       const animDir = path.join(tmpDir, "anim");
@@ -922,12 +892,13 @@ export function retryStockGenerationClip(jobId: string, index: number, mode: "im
       remember(status);
       step.displayName = stockClipDisplayName(step.index);
       const driveName = stockClipDriveName(status, step);
-      const driveId = await uploadFile(videoPath, driveFolder.id, { name: driveName, mimeType: "video/mp4" });
+      const driveId = saveBRollClip(status.channelName || status.folder, videoPath, driveName);
       step.uploadStatus = "done";
       step.uploadFinishedAt = Date.now();
       step.driveFileId = driveId;
       step.driveName = driveName;
-      step.driveFileLink = driveFileLink(driveId);
+      step.driveFileLink = null;
+      step.videoPath = videoPath;
       step.status = "complete";
       step.lastProgressAt = Date.now();
       status.done++;

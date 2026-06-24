@@ -73,7 +73,7 @@ export function YouTubeChannelBinder({
   hasKey: boolean;
   onChannelsChanged?: () => void;
   /** Fired after a successful sync with the resolved channel, so callers can
-   *  mirror it into the Studio (Supabase) channel store. */
+   *  mirror it into the Studio channel store. */
   onChannelSynced?: (ch: { id: string; title: string | null; handle: string | null; avatar_url: string | null }) => void | Promise<void>;
   /** If provided, called instead of window.location.reload() after switching
    *  the active channel — lets the parent refresh in-place. */
@@ -233,7 +233,7 @@ export function YouTubeChannelBinder({
               await loadBound(); // refresh the bound-channels list
               setChannelsListExpanded(true); // reveal the new channel without a page refresh
               onChannelsChanged?.();
-              // Mirror the synced channel into the Studio (Supabase) store.
+              // Mirror the synced channel into the Studio store.
               if (syncedChannel) {
                 await onChannelSynced?.({
                   id: syncedChannel.id,
