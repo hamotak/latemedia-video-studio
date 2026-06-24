@@ -33,10 +33,10 @@ import { PageContainer } from "@/components/ui/page-container";
 import { PageHeader } from "@/components/ui/page-header";
 import { Textarea } from "@/components/ui/textarea";
 import { VideoWorkspaceTabs } from "@/components/video-workspace-tabs";
-import { StudioCommandBar } from "@/components/studio-command-bar";
+import { VideoWorkspaceShell } from "@/components/video-workspace-shell";
+import { Modal } from "@/components/ui/modal";
 import { cn } from "@/lib/utils";
 import { estimateScript } from "@/lib/video-engine/script-estimate";
-import { getStudioSidebarOffset, STUDIO_SIDEBAR_TOGGLE_EVENT } from "@/lib/studio-sidebar-offset";
 
 type Run = {
   id: string;
@@ -197,9 +197,7 @@ function VideoStudio({ channelId }: { channelId: number }) {
   const introApplied = useRef(false);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState("");
-  const [historyOverlayMode, setHistoryOverlayMode] = useState(true);
-  const [historyOverlayOpen, setHistoryOverlayOpen] = useState(false);
-  const [historyOverlayLeft, setHistoryOverlayLeft] = useState(0);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   const selectRun = useCallback((id: string | null) => {
     setOpenRunId(id);
@@ -282,26 +280,6 @@ function VideoStudio({ channelId }: { channelId: number }) {
   }, [profile?.presetId, profile?.hybridFreshMinutes]);
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    const mq = window.matchMedia("(max-width: 1279.98px)");
-    const sync = () => {
-      setHistoryOverlayMode(mq.matches);
-      if (!mq.matches) setHistoryOverlayOpen(false);
-      setHistoryOverlayLeft(getStudioSidebarOffset());
-    };
-    const onSidebarToggle = () => window.setTimeout(sync, 0);
-    sync();
-    mq.addEventListener("change", sync);
-    window.addEventListener("resize", sync);
-    window.addEventListener(STUDIO_SIDEBAR_TOGGLE_EVENT, onSidebarToggle);
-    return () => {
-      mq.removeEventListener("change", sync);
-      window.removeEventListener("resize", sync);
-      window.removeEventListener(STUDIO_SIDEBAR_TOGGLE_EVENT, onSidebarToggle);
-    };
-  }, []);
-
-  useEffect(() => {
     const anyActive = runs.some((r) => r.status === "running" || r.status === "pending");
     if (!anyActive || !profile?.presetId) return;
     const presetId = profile.presetId;
@@ -342,80 +320,62 @@ function VideoStudio({ channelId }: { channelId: number }) {
   };
 
   return (
-    <div className="-mx-6 -mb-6 -mt-20 flex h-[calc(100vh-3.5rem)]">
-      {historyOverlayMode && historyOverlayOpen && (
-        <button
-          aria-label="Close history"
-          type="button"
-          onClick={() => setHistoryOverlayOpen(false)}
-          className="fixed inset-y-0 right-0 z-30 bg-black/40"
-          style={{ left: historyOverlayLeft }}
-        />
-      )}
-      <VideoHistoryRail
-        runs={runs}
-        loading={profileLoading}
-        selectedId={openRunId}
-        overlayMode={historyOverlayMode}
-        overlayOpen={historyOverlayOpen}
-        overlayLeft={historyOverlayLeft}
-        onSelect={(id) => {
-          selectRun(id);
-          if (historyOverlayMode) setHistoryOverlayOpen(false);
-        }}
-      />
-
-      <main className="flex-1 overflow-y-auto">
-        <PageContainer className="max-w-[1440px] space-y-5 pb-10 pt-20">
-          <PageHeader title="Video" />
-          <StudioCommandBar
-            showHistory={historyOverlayMode}
-            onHistoryClick={() => setHistoryOverlayOpen(true)}
-            actions={
-              <div className="flex max-w-[860px] flex-wrap items-center justify-end gap-2">
-                {openRunId && (
-                  <Button type="button" variant="outline" size="sm" onClick={() => selectRun(null)} className="h-8 gap-1.5">
-                    <Clapperboard className="h-3.5 w-3.5" />
-                    New video
-                  </Button>
-                )}
-                <VideoHeaderActions
-                  runs={runs}
-                  onRefresh={() => void loadRuns(profile?.presetId ?? null)}
-                  onOpen={selectRun}
-                />
-              </div>
-            }
+    <>
+      <VideoWorkspaceShell
+        onHistoryClick={() => setHistoryOpen(true)}
+        actions={
+          <div className="flex max-w-[860px] flex-wrap items-center justify-end gap-2">
+            {openRunId && (
+              <Button type="button" variant="outline" size="sm" onClick={() => selectRun(null)} className="h-8 gap-1.5">
+                <Clapperboard className="h-3.5 w-3.5" />
+                New video
+              </Button>
+            )}
+            <VideoHeaderActions
+              runs={runs}
+              onRefresh={() => void loadRuns(profile?.presetId ?? null)}
+              onOpen={selectRun}
+            />
+          </div>
+        }
+      >
+        {openRunId ? (
+          <VideoRunDetailPage
+            runId={openRunId}
+            onBackToNew={() => selectRun(null)}
+            onRunChanged={() => void loadRuns(profile?.presetId ?? null)}
+            onDeleted={() => { selectRun(null); void loadRuns(profile?.presetId ?? null); }}
           />
+        ) : (
+          <VideoComposer
+            mode={mode}
+            introMinutes={introMinutes}
+            title={title}
+            script={script}
+            error={error}
+            disabled={starting || profileLoading || !profile?.presetId}
+            busy={starting || profileLoading}
+            onModeChange={updateMode}
+            onIntroMinutesChange={setIntroMinutes}
+            onTitleChange={updateTitle}
+            onScriptChange={updateScript}
+            onStart={startRun}
+          />
+        )}
+      </VideoWorkspaceShell>
 
-          <VideoWorkspaceTabs />
-
-          {openRunId ? (
-            <VideoRunDetailPage
-              runId={openRunId}
-              onBackToNew={() => selectRun(null)}
-              onRunChanged={() => void loadRuns(profile?.presetId ?? null)}
-              onDeleted={() => { selectRun(null); void loadRuns(profile?.presetId ?? null); }}
-            />
-          ) : (
-            <VideoComposer
-              mode={mode}
-              introMinutes={introMinutes}
-              title={title}
-              script={script}
-              error={error}
-              disabled={starting || profileLoading || !profile?.presetId}
-              busy={starting || profileLoading}
-              onModeChange={updateMode}
-              onIntroMinutesChange={setIntroMinutes}
-              onTitleChange={updateTitle}
-              onScriptChange={updateScript}
-              onStart={startRun}
-            />
-          )}
-        </PageContainer>
-      </main>
-    </div>
+      <Modal open={historyOpen} onClose={() => setHistoryOpen(false)} title="History">
+        <VideoHistoryList
+          runs={runs}
+          loading={profileLoading}
+          selectedId={openRunId}
+          onSelect={(id) => {
+            selectRun(id);
+            setHistoryOpen(false);
+          }}
+        />
+      </Modal>
+    </>
   );
 }
 
@@ -579,82 +539,47 @@ function VideoHeaderActions({
   );
 }
 
-function VideoHistoryRail({
+function VideoHistoryList({
   runs,
   loading,
   selectedId,
-  overlayMode,
-  overlayOpen,
-  overlayLeft,
   onSelect,
 }: {
   runs: Run[];
   loading: boolean;
   selectedId: string | null;
-  overlayMode: boolean;
-  overlayOpen: boolean;
-  overlayLeft: number;
   onSelect: (id: string) => void;
 }) {
-  const overlayClosed = overlayMode && !overlayOpen;
-
+  if (loading) {
+    return <p className="px-5 py-4 text-xs text-muted-foreground">Loading...</p>;
+  }
+  if (runs.length === 0) {
+    return <p className="px-5 py-4 text-xs text-muted-foreground">No video history yet.</p>;
+  }
   return (
-    <aside
-      className={cn(
-        "flex w-60 shrink-0 flex-col overflow-y-auto border-r border-border bg-background/40",
-        overlayMode ? "studio-history-rail fixed inset-y-0 z-40 bg-background" : "",
-        overlayClosed && "pointer-events-none"
-      )}
-      data-open={overlayOpen ? "true" : "false"}
-      data-sidebar-offset={overlayLeft}
-      aria-hidden={overlayClosed}
-      inert={overlayClosed ? true : undefined}
-    >
-      <div className="px-4 py-5">
-        <h2 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">History</h2>
-      </div>
-      {loading ? (
-        <p className="px-4 text-xs text-muted-foreground">Loading...</p>
-      ) : runs.length === 0 ? (
-        <p className="px-4 text-xs text-muted-foreground">No video history yet.</p>
-      ) : (
-        <>
-          <div className="px-3 pb-2">
-            <button
-              type="button"
-              onClick={() => onSelect(runs[0].id)}
-              className="flex w-full items-center justify-between rounded-md border border-border bg-muted/25 px-3 py-2 text-left text-xs font-medium text-foreground transition-colors hover:bg-accent/50"
-            >
-              <span>Latest run</span>
-              <span className="text-muted-foreground">{relativeRunTime(runs[0].created_at)}</span>
-            </button>
-          </div>
-          <ul>
-            {runs.map((run) => (
-              <li key={run.id}>
-                <button
-                  type="button"
-                  onClick={() => onSelect(run.id)}
-                  className={cn(
-                    "block w-full px-4 py-3 text-left text-sm transition-colors hover:bg-accent/40",
-                    selectedId === run.id && "bg-accent/60"
-                  )}
-                >
-                  <div className="flex items-baseline justify-between gap-2">
-                    <span className="line-clamp-1 text-foreground">{runTitle(run)}</span>
-                    <RunStatusPill run={run} />
-                  </div>
-                  <div className="mt-1 flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                    <span>{formatModeLabel(run.mode)}</span>
-                    <span>{relativeRunTime(run.created_at)}</span>
-                  </div>
-                </button>
-              </li>
-            ))}
-          </ul>
-        </>
-      )}
-    </aside>
+    <ul className="divide-y divide-border">
+      {runs.map((run) => (
+        <li key={run.id}>
+          <button
+            type="button"
+            onClick={() => onSelect(run.id)}
+            className={cn(
+              "block w-full px-5 py-3 text-left text-sm transition-colors hover:bg-accent/40",
+              selectedId === run.id && "bg-accent/60"
+            )}
+          >
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="line-clamp-1 text-foreground">{runTitle(run)}</span>
+              <RunStatusPill run={run} />
+            </div>
+            <div className="mt-1 flex items-center justify-between gap-2 text-xs text-muted-foreground">
+              <span>{formatModeLabel(run.mode)}</span>
+              <span>{relativeRunTime(run.created_at)}</span>
+            </div>
+          </button>
+        </li>
+      ))}
+    </ul>
   );
 }
 

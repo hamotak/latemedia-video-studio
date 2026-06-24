@@ -1,37 +1,30 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Check, Clapperboard, HardDrive, Loader2, PlugZap } from "lucide-react";
+import { Check, FolderOpen, KeyRound, Loader2, Sliders } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button, buttonVariants } from "@/components/ui/button";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { fetchJson } from "@/lib/client-fetch";
-import { cn } from "@/lib/utils";
 
 /**
- * Video pipeline render settings. Provider API keys live in the global
- * Integrations cards above; this section keeps only non-secret model,
- * provider, path, and render knobs.
+ * Video pipeline settings for the standalone app.
+ *
+ * The only things a user needs: paste their API keys, and (optionally) tweak a
+ * couple of render knobs. Everything else — scene-split model, image model,
+ * animation model — stays at the proven defaults from
+ * `video-engine/settings.ts` and is intentionally not exposed.
  */
-const RENDER_FIELDS: { key: string; label: string }[] = [
-  { key: "SCENE_SPLIT_PROVIDER", label: "Scene split provider" },
-  { key: "SCENE_SPLIT_MODEL", label: "Scene split model" },
-  { key: "IMAGE_PROVIDER", label: "Image provider" },
-  { key: "IMAGE_MODEL", label: "Image model" },
-  { key: "IMAGE_RATIO", label: "Image ratio" },
-  { key: "ANIMATION_PROVIDER", label: "Animation provider" },
-  { key: "ANIMATION_MODEL", label: "Animation model" },
-  { key: "VIDEO_RESOLUTION", label: "Video resolution" },
-  { key: "VIDEO_FPS", label: "Video FPS" },
-  { key: "FFMPEG_PATH", label: "FFmpeg path" },
-  { key: "RUNS_OUTPUT_DIR", label: "Renders temp folder" },
+const API_KEY_FIELDS: { key: string; label: string; hint?: string }[] = [
+  { key: "LABS69_API_KEY", label: "69labs API key", hint: "Required — video, voiceover & images." },
+  { key: "GOOGLE_API_KEY", label: "Google Gemini API key", hint: "Required — scene splitting & visual prompts." },
 ];
 
-const DRIVE_FIELDS: { key: string; label: string; hint?: string }[] = [
-  { key: "GDRIVE_CLIENT_ID", label: "Google OAuth client ID" },
-  { key: "GDRIVE_CLIENT_SECRET", label: "Google OAuth client secret" },
-  { key: "GDRIVE_SYNC_ENABLED", label: "Sync finished renders to Drive", hint: "Use 1 for on, 0 for off." },
+const ADVANCED_FIELDS: { key: string; label: string; hint?: string }[] = [
+  { key: "VIDEO_RESOLUTION", label: "Video resolution", hint: "e.g. 1920x1080" },
+  { key: "VIDEO_FPS", label: "Video FPS", hint: "24, 30 or 60" },
+  { key: "FFMPEG_PATH", label: "FFmpeg path", hint: "Leave blank — FFmpeg is bundled." },
 ];
 
 export function VideoPipelineSettings() {
@@ -42,33 +35,7 @@ export function VideoPipelineSettings() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [driveNotice, setDriveNotice] = useState<{
-    kind: "success" | "error";
-    message: string;
-  } | null>(null);
-  const [redirectUri, setRedirectUri] = useState("/api/gdrive/oauth/callback");
-
-  useEffect(() => {
-    setRedirectUri(`${window.location.origin}/api/gdrive/oauth/callback`);
-    const params = new URLSearchParams(window.location.search);
-    const drive = params.get("drive");
-    const driveError = params.get("driveError");
-    if (drive === "connected") {
-      setDriveNotice({ kind: "success", message: "Google Drive connected." });
-    } else if (drive === "admin-required") {
-      setDriveNotice({ kind: "error", message: "Only admins can connect Google Drive." });
-    } else if (drive === "setup-required") {
-      setDriveNotice({
-        kind: "error",
-        message: driveError || "Google Drive OAuth is not configured yet.",
-      });
-    } else if (drive === "error") {
-      setDriveNotice({
-        kind: "error",
-        message: driveError || "Google Drive connection failed.",
-      });
-    }
-  }, []);
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -83,13 +50,15 @@ export function VideoPipelineSettings() {
       setMasked(data.settings ?? {});
       setEdits({});
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not load video settings.");
+      setError(err instanceof Error ? err.message : "Could not load settings.");
     } finally {
       setLoading(false);
     }
   }, []);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    void load();
+  }, [load]);
 
   const save = async () => {
     setSaving(true);
@@ -108,7 +77,7 @@ export function VideoPipelineSettings() {
       setSaved(true);
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not save video settings.");
+      setError(err instanceof Error ? err.message : "Could not save settings.");
     } finally {
       setSaving(false);
     }
@@ -117,19 +86,21 @@ export function VideoPipelineSettings() {
   // Non-admins (403) don't get this section at all.
   if (!allowed) return null;
 
+  const outputDir = masked.LOCAL_LIBRARY_DIR || "Desktop → Late Media Videos";
+
   return (
     <Card>
       <CardHeader className="flex flex-row items-start justify-between space-y-0 pb-3">
         <div className="flex items-start gap-2.5">
           <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
-            <Clapperboard className="h-3.5 w-3.5" />
+            <KeyRound className="h-3.5 w-3.5" />
           </span>
           <div>
-            <CardTitle>Video pipeline</CardTitle>
+            <CardTitle>API keys & video settings</CardTitle>
           </div>
         </div>
       </CardHeader>
-      <CardContent className="space-y-4 pt-0">
+      <CardContent className="space-y-5 pt-0">
         {loading ? (
           <div className="flex justify-center py-6">
             <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
@@ -141,60 +112,40 @@ export function VideoPipelineSettings() {
                 {error}
               </p>
             )}
-            <SettingsFieldGrid fields={RENDER_FIELDS} masked={masked} edits={edits} onChange={setEdits} />
 
-            <div className="rounded-lg border border-border bg-background/50 p-4">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div className="flex items-start gap-2.5">
-                  <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
-                    <HardDrive className="h-3.5 w-3.5" />
-                  </span>
-                  <div>
-                    <h3 className="text-sm font-semibold">Google Drive sync</h3>
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      Saves final videos and reusable clips into Drive. Add the OAuth client credentials, then connect.
-                    </p>
-                  </div>
-                </div>
-                <a
-                  href="/api/gdrive/oauth/start?returnTo=/admin/settings/video"
-                  className={cn(
-                    buttonVariants({ variant: "outline", size: "sm" }),
-                    (!masked.GDRIVE_CLIENT_ID || !masked.GDRIVE_CLIENT_SECRET) && "pointer-events-none opacity-50"
-                  )}
-                  aria-disabled={!masked.GDRIVE_CLIENT_ID || !masked.GDRIVE_CLIENT_SECRET}
-                >
-                  <PlugZap className="h-3.5 w-3.5" />
-                  {masked.GDRIVE_CONNECTED_EMAIL ? "Reconnect Drive" : "Connect Drive"}
-                </a>
+            <div className="space-y-3">
+              <div>
+                <h3 className="text-sm font-semibold">API keys</h3>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Paste your keys below — they are stored only on this computer. A saved key shows as
+                  dots; type a new value to replace it.
+                </p>
               </div>
+              <SettingsFieldGrid fields={API_KEY_FIELDS} masked={masked} edits={edits} onChange={setEdits} secret />
+            </div>
 
-              <div className="mt-4 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-                Google Cloud redirect URI: <span className="font-mono text-foreground">{redirectUri}</span>
-              </div>
+            <div className="flex items-start gap-2.5 rounded-lg border border-border bg-background/50 p-3">
+              <FolderOpen className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+              <p className="text-xs text-muted-foreground">
+                Finished videos and B-Rolls are saved locally to{" "}
+                <span className="font-medium text-foreground">{outputDir}</span>.
+              </p>
+            </div>
 
-              {driveNotice && (
-                <div
-                  className={cn(
-                    "mt-3 rounded-md border px-3 py-2 text-xs",
-                    driveNotice.kind === "success"
-                      ? "border-emerald-500/25 bg-emerald-500/5 text-emerald-700 dark:text-emerald-400"
-                      : "border-destructive/30 bg-destructive/10 text-destructive"
-                  )}
-                >
-                  {driveNotice.message}
+            <div className="rounded-lg border border-border bg-background/50">
+              <button
+                type="button"
+                onClick={() => setShowAdvanced((v) => !v)}
+                className="flex w-full items-center gap-2 px-4 py-3 text-left text-sm font-medium text-muted-foreground transition-colors hover:text-foreground"
+              >
+                <Sliders className="h-3.5 w-3.5" />
+                Advanced (optional)
+              </button>
+              {showAdvanced && (
+                <div className="border-t border-border p-4">
+                  <SettingsFieldGrid fields={ADVANCED_FIELDS} masked={masked} edits={edits} onChange={setEdits} />
                 </div>
               )}
-
-              {masked.GDRIVE_CONNECTED_EMAIL && (
-                <div className="mt-3 rounded-md border border-emerald-500/25 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-400">
-                  Connected as {masked.GDRIVE_CONNECTED_EMAIL}
-                </div>
-              )}
-
-              <div className="mt-4">
-                <SettingsFieldGrid fields={DRIVE_FIELDS} masked={masked} edits={edits} onChange={setEdits} />
-              </div>
             </div>
 
             <div className="flex items-center justify-end gap-3 border-t border-border pt-4">
@@ -216,11 +167,13 @@ function SettingsFieldGrid({
   masked,
   edits,
   onChange,
+  secret,
 }: {
   fields: { key: string; label: string; hint?: string }[];
   masked: Record<string, string>;
   edits: Record<string, string>;
   onChange: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+  secret?: boolean;
 }) {
   return (
     <div className="grid gap-4 sm:grid-cols-2">
@@ -231,10 +184,10 @@ function SettingsFieldGrid({
             <Label htmlFor={`video-${f.key}`} className="text-xs">{f.label}</Label>
             <Input
               id={`video-${f.key}`}
-              type="text"
+              type={secret ? "password" : "text"}
               value={edits[f.key] ?? ""}
               onChange={(e) => onChange((p) => ({ ...p, [f.key]: e.target.value }))}
-              placeholder={current}
+              placeholder={current || (secret ? "Paste key…" : "")}
               className="h-9 text-sm"
               autoComplete="off"
             />

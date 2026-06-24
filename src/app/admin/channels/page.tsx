@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { Plus, Tv2, Clapperboard, RefreshCw } from "lucide-react";
+import { Plus, Tv2, Clapperboard, RefreshCw, Pencil } from "lucide-react";
 import { useActiveChannel } from "@/lib/active-channel-context";
 import { PageContainer } from "@/components/ui/page-container";
 import { PageHeader } from "@/components/ui/page-header";
@@ -89,6 +89,13 @@ export default function AdminChannelsPage() {
                     Use
                   </Button>
                 )}
+                <Link
+                  href={`/admin/channels/${channel.id}`}
+                  className={buttonVariants({ variant: "ghost", size: "sm" })}
+                >
+                  <Pencil className="h-4 w-4" />
+                  Edit
+                </Link>
                 <Link
                   href="/studio/video"
                   className={buttonVariants({ variant: "ghost", size: "sm" })}

@@ -8,6 +8,7 @@ import type { Scene } from "./scene-split";
 import { generateImage } from "./image-gen";
 import { animateScene } from "./img2vid";
 import { uploadFile, uploadString } from "./gdrive";
+import { saveBRollClip } from "../local-output";
 import { driveFileLink, ensureChannelStockBrollFolder, ensureStockCollectionFolder } from "./drive-workspace";
 import { cancelJob } from "./labs69";
 
@@ -673,30 +674,21 @@ export function startStockGeneration(opts: {
           remember(status);
           step.displayName = stockClipDisplayName(step.index);
           const driveName = stockClipDriveName(status, step);
-          const driveId = await uploadFile(videoPath, driveFolder.id, { name: driveName, mimeType: "video/mp4" });
+          // Save the clip into the channel's local B-Roll folder (no Drive).
+          const clipId = saveBRollClip(status.channelName || folder, videoPath, driveName);
           step.uploadStatus = "done";
           step.uploadFinishedAt = Date.now();
           step.lastProgressAt = Date.now();
-          step.driveFileId = driveId;
+          step.driveFileId = clipId;
           step.driveName = driveName;
-          step.driveFileLink = driveFileLink(driveId);
-
-          const cachedName = `${driveId}__${driveName.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
-          const cachedPath = path.join(animDir, cachedName);
-          try {
-            fs.renameSync(videoPath, cachedPath);
-            step.videoPath = cachedPath;
-            const oldManifest = videoPath.replace(/\.mp4$/i, ".manifest.json");
-            if (fs.existsSync(oldManifest)) fs.renameSync(oldManifest, cachedPath.replace(/\.mp4$/i, ".manifest.json"));
-          } catch {
-            step.videoPath = videoPath;
-          }
+          step.driveFileLink = null;
+          step.videoPath = videoPath;
           step.status = "complete";
           status.done++;
           remember(status);
-          log(runId, "success", `Stock clip ${step.index + 1} uploaded to Drive: ${driveName}`, {
+          log(runId, "success", `Stock clip ${step.index + 1} saved to local B-Rolls: ${driveName}`, {
             stage: "image",
-            data: { prompt: step.prompt, imageJobId: step.imageJobId, videoJobId: step.videoJobId, driveFileId: driveId },
+            data: { prompt: step.prompt, imageJobId: step.imageJobId, videoJobId: step.videoJobId, clipId },
           });
         } catch (e) {
           const msg = e instanceof Error ? e.message.slice(0, 160) : String(e);

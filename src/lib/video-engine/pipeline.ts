@@ -30,7 +30,7 @@ import { createShuffledStockDeckPicker } from "./stock-relevance";
 import { ensureVideoPoster } from "./services/video-poster";
 import { cancelJob, discoverLabs69AccountLimits, discoverLabs69Runtime } from "./services/labs69";
 import { effectiveLiveSlots, effectiveProviderSlots } from "./services/labs69-capacity";
-import { syncRunToDrive } from "./services/run-upload";
+import { copyRunToDesktop } from "./local-output";
 import { checkCancelled, clearCancelled, isCancelled, CancelledError } from "./cancellation";
 import { loadStylePreset } from "./style-presets";
 import { WORDS_PER_MINUTE } from "./script-estimate";
@@ -302,7 +302,7 @@ function generatedVideoReady(videoPath: string): boolean {
 function completeRunThenSyncDrive(
   runId: string,
   finalPath: string,
-  sceneAssets: AssembleInput[],
+  _sceneAssets: AssembleInput[],
   runDir: string,
   completeMessage: string
 ): void {
@@ -311,12 +311,9 @@ function completeRunThenSyncDrive(
   void mirrorVideoRun(runId).catch(() => {});
   log(runId, "success", completeMessage, { stage: "pipeline", data: { finalPath } });
 
-  void syncRunToDrive(runId, sceneAssets, runDir, finalPath).catch((e) => {
-    const msg = e instanceof Error ? e.message : String(e);
-    log(runId, "warn", `Drive sync failed after local completion (local files preserved): ${msg}`, {
-      stage: "gdrive",
-    });
-  });
+  // Standalone build: save the finished video to the local Desktop library
+  // instead of Google Drive.
+  copyRunToDesktop(runId, finalPath, runDir);
 }
 
 /**

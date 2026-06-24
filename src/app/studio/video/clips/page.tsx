@@ -24,6 +24,8 @@ import { PageHeader } from "@/components/ui/page-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { VideoWorkspaceTabs } from "@/components/video-workspace-tabs";
+import { VideoWorkspaceShell } from "@/components/video-workspace-shell";
+import { Modal } from "@/components/ui/modal";
 import { cn } from "@/lib/utils";
 
 interface StockClip {
@@ -899,6 +901,7 @@ function BrollsView({ channelId, channelName }: { channelId: number; channelName
   const [hoveredClipId, setHoveredClipId] = useState<string | null>(null);
   const [visibleCardLimit, setVisibleCardLimit] = useState(INITIAL_VISIBLE_CARD_LIMIT);
   const [activeBatch, setActiveBatch] = useState<ActiveBatchSnapshot>(emptyActiveBatch);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const loadSeqRef = useRef(0);
 
   const load = useCallback(async () => {
@@ -1114,10 +1117,10 @@ function BrollsView({ channelId, channelName }: { channelId: number; channelName
   const activeCount = selectableIds.length;
 
   return (
-    <PageContainer className="max-w-[1440px] space-y-5">
-      <PageHeader
-        title="Video"
-        action={
+    <>
+      <VideoWorkspaceShell
+        onHistoryClick={() => setHistoryOpen(true)}
+        actions={
           <div className="flex flex-wrap items-center justify-end gap-2">
             {driveFolderLink && (
               <a href={driveFolderLink} target="_blank" rel="noopener noreferrer">
@@ -1137,9 +1140,7 @@ function BrollsView({ channelId, channelName }: { channelId: number; channelName
             </Button>
           </div>
         }
-      />
-
-      <VideoWorkspaceTabs />
+      >
 
       <StockGenerationPanel
         channelId={channelId}
@@ -1342,7 +1343,73 @@ function BrollsView({ channelId, channelName }: { channelId: number; channelName
           </div>
         )}
       </section>
-    </PageContainer>
+      </VideoWorkspaceShell>
+
+      <Modal open={historyOpen} onClose={() => setHistoryOpen(false)} title="History">
+        <BrollHistoryList channelId={channelId} open={historyOpen} />
+      </Modal>
+    </>
+  );
+}
+
+function BrollHistoryList({ channelId, open }: { channelId: number; open: boolean }) {
+  const [jobs, setJobs] = useState<StockGenJob[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setJobs(null);
+    setError(null);
+    const params = new URLSearchParams({ channelId: String(channelId), limit: "50" });
+    fetch(`/api/video/stock/generate/history?${params.toString()}`, { cache: "no-store" })
+      .then((r) => r.json())
+      .then((d: { jobs?: StockGenJob[]; error?: string }) => {
+        if (cancelled) return;
+        if (d.error) {
+          setError(d.error);
+          setJobs([]);
+          return;
+        }
+        setJobs(Array.isArray(d.jobs) ? d.jobs : []);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : "Could not load history");
+        setJobs([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [channelId, open]);
+
+  if (error) return <p className="px-5 py-4 text-xs text-destructive">{error}</p>;
+  if (jobs === null) return <p className="px-5 py-4 text-xs text-muted-foreground">Loading...</p>;
+  if (jobs.length === 0) {
+    return <p className="px-5 py-4 text-xs text-muted-foreground">No generation history yet.</p>;
+  }
+
+  return (
+    <ul className="divide-y divide-border">
+      {jobs.map((job, index) => (
+        <li key={job.jobId ?? index} className="px-5 py-3">
+          <div className="flex items-baseline justify-between gap-2">
+            <span className="line-clamp-1 text-sm text-foreground">
+              {job.theme || job.styleBrief || "B-roll batch"}
+            </span>
+            <span className="shrink-0 text-xs text-muted-foreground">
+              {timeValue(job.finishedAt ?? job.startedAt)}
+            </span>
+          </div>
+          <div className="mt-1 flex items-center justify-between gap-2 text-xs text-muted-foreground">
+            <span>{jobStatusLabel(job)}</span>
+            <span>
+              {job.done}/{job.total} clips
+            </span>
+          </div>
+        </li>
+      ))}
+    </ul>
   );
 }
 

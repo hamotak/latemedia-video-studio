@@ -1,9 +1,6 @@
 import { ensureInit } from "@/lib/video-engine/init";
 import { getFileStream } from "@/lib/video-engine/services/gdrive";
-import {
-  isLocalStockClipId,
-  resolveLocalStockClipPath,
-} from "@/lib/video-engine/services/stock-library";
+import { isBRollClipId, resolveBRollClipPath } from "@/lib/video-engine/local-output";
 import { requireVideoEditUser } from "@/lib/video-access";
 import fs from "node:fs";
 import { Readable } from "node:stream";
@@ -64,8 +61,9 @@ export async function GET(req: Request) {
   const id = new URL(req.url).searchParams.get("id");
   if (!id) return new Response("Missing id", { status: 400 });
   try {
-    if (isLocalStockClipId(id)) {
-      const localPath = resolveLocalStockClipPath(id);
+    if (isBRollClipId(id)) {
+      const localPath = resolveBRollClipPath(id);
+      if (!localPath) return new Response("Not found", { status: 404 });
       const stream = fs.createReadStream(localPath);
       return new Response(streamNode(stream), {
         headers: { "Content-Type": "video/mp4", "Cache-Control": "no-store" },

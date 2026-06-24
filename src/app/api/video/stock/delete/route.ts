@@ -1,13 +1,8 @@
 import { NextResponse } from "next/server";
-import fs from "node:fs";
 import { ensureInit } from "@/lib/video-engine/init";
 import { trashFile } from "@/lib/video-engine/services/gdrive";
 import { markStockClipsDeletedByDriveIds } from "@/lib/video-engine/services/stock-gen";
-import {
-  deleteCachedDriveCopies,
-  isLocalStockClipId,
-  resolveLocalStockClipPath,
-} from "@/lib/video-engine/services/stock-library";
+import { isBRollClipId, deleteBRollClip } from "@/lib/video-engine/local-output";
 import { tryParseJson, isJsonObject } from "@/lib/video-engine/json-body";
 import { requireVideoEditUser } from "@/lib/video-access";
 import { parseOptionalChannelId } from "../generate/_shared";
@@ -39,9 +34,8 @@ export async function POST(req: Request) {
   const errors: string[] = [];
   for (const id of ids) {
     try {
-      if (isLocalStockClipId(id)) {
-        fs.rmSync(resolveLocalStockClipPath(id), { force: true });
-        localDeleted++;
+      if (isBRollClipId(id)) {
+        if (deleteBRollClip(id)) localDeleted++;
       } else {
         await trashFile(id);
         trashedDriveIds.push(id);
@@ -51,7 +45,6 @@ export async function POST(req: Request) {
       errors.push(`${id}: ${e instanceof Error ? e.message : String(e)}`.slice(0, 120));
     }
   }
-  localDeleted += deleteCachedDriveCopies(trashedDriveIds);
   const jobsUpdated = markStockClipsDeletedByDriveIds(trashedDriveIds);
   return NextResponse.json({ deleted, localDeleted, failed: errors.length, errors, jobsUpdated });
 }

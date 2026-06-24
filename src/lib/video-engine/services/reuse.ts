@@ -1,6 +1,8 @@
+import fs from "node:fs";
 import path from "node:path";
 import { downloadFile } from "./gdrive";
 import { log } from "../logger";
+import { isBRollClipId, resolveBRollClipPath } from "../local-output";
 import type { Scene } from "./scene-split";
 
 /**
@@ -20,6 +22,18 @@ export async function downloadReusedClip(
 ): Promise<string> {
   const padded = String(scene.index).padStart(3, "0");
   const destPath = path.join(animDir, `scene_${padded}.mp4`);
+
+  // Local B-Roll library: copy from disk instead of downloading from Drive.
+  if (isBRollClipId(driveFileId)) {
+    const src = resolveBRollClipPath(driveFileId);
+    if (!src) throw new Error("Reused B-Roll clip not found in the local library.");
+    log(runId, "info", `Scene #${scene.index}: reusing local B-Roll clip`, {
+      stage: "reuse",
+      data: { driveFileId },
+    });
+    fs.copyFileSync(src, destPath);
+    return destPath;
+  }
 
   log(
     runId,
